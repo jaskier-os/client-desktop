@@ -1,0 +1,38 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Certificates / keys (never commit)
+*.pem
+*.crt
+*.key
+*.p12
+*.pfx
+
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.cache/
+
+# Logs / coverage
+*.log
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Models (downloaded on demand, not committed)
+models/

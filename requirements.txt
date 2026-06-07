@@ -1,0 +1,9 @@
+# Desktop relay client runtime dependencies.
+# Exact versions pinned for reproducible installs (resolved on Python 3.12).
+PyQt6==6.7.1
+websocket-client==1.8.0
+aiortc==1.9.0
+av==12.3.0
+opencv-python==4.10.0.84
+evdev==1.7.1
+python-dotenv==1.0.1
