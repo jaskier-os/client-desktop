@@ -14,9 +14,11 @@ log = logging.getLogger(__name__)
 class TrayIcon:
     """Wraps QSystemTrayIcon with a settings/quit menu."""
 
-    def __init__(self, app, listener):
+    def __init__(self, app, listener, config_path, config):
         self._app = app
         self._listener = listener
+        self._config_path = config_path
+        self._config = config
 
         icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "icon.png")
         self._tray = QSystemTrayIcon(QIcon(icon_path), app)
@@ -37,7 +39,7 @@ class TrayIcon:
         self._tray.show()
 
     def _open_settings(self):
-        dialog = SettingsDialog()
+        dialog = SettingsDialog(self._config_path, self._config)
         dialog.exec()
 
     def _quit(self):

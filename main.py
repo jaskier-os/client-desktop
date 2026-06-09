@@ -1,14 +1,15 @@
 """Desktop relay client: orchestrator connection + mouse/keyboard/audio relay."""
 
 import argparse
+import configparser
 import logging
+import os
 import signal
 import sys
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
-from src import config
 from src.orchestrator_client import OrchestratorClient
 from src.mouse_relay import MouseRelay
 from src.keyboard_relay import KeyboardRelay
@@ -22,9 +23,14 @@ log = logging.getLogger("listener")
 class ListenerApp:
     """Desktop relay: orchestrator connection + mouse/keyboard/audio relay."""
 
-    def __init__(self):
+    def __init__(self, config_path):
+        self.config_path = config_path
+        cfg = configparser.RawConfigParser()
+        cfg.read(config_path)
+        self.config = cfg
+
         # Orchestrator
-        self.model = config.ORCHESTRATOR_MODEL
+        model = cfg.get("orchestrator", "model", fallback="sonnet")
 
         # Mouse relay for remote desktop control
         self._mouse_relay = MouseRelay()
@@ -36,12 +42,8 @@ class ListenerApp:
         self._audio_relay = AudioRelay()
 
         # Orchestrator WebSocket client
-        self._orchestrator = OrchestratorClient(
-            config.ORCHESTRATOR_WS_URL,
-            device_id=config.DEVICE_ID,
-            model=self.model,
-            tls_cert_path=config.resolve_tls_cert(),
-        )
+        ws_url = cfg.get("orchestrator", "ws_url", fallback="ws://localhost:10001/ws/device")
+        self._orchestrator = OrchestratorClient(ws_url, device_id="desktop-listener", model=model)
         self._orchestrator.on_mouse_event = self._mouse_relay.handle_event
         self._orchestrator.on_keyboard_event = self._keyboard_relay.handle_event
         self._orchestrator.on_audio_relay_start = self._on_audio_relay_start
@@ -96,7 +98,8 @@ class ListenerApp:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Desktop relay client for the orchestrator")
+    parser = argparse.ArgumentParser(description="Voice listener with wake word detection")
+    parser.add_argument("--config", default="config.ini", help="Path to config.ini")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -106,14 +109,21 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    log.info("Connecting to orchestrator at %s", config.ORCHESTRATOR_WS_URL)
+    config_path = args.config
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_path)
+
+    if not os.path.exists(config_path):
+        log.error("Config file not found: %s", config_path)
+        log.error("Copy config.ini.example to config.ini and edit it.")
+        sys.exit(1)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    listener = ListenerApp()
+    listener = ListenerApp(config_path)
 
-    tray = TrayIcon(app, listener)
+    tray = TrayIcon(app, listener, listener.config_path, listener.config)
     tray.show()
 
     def sigint_handler(*_):

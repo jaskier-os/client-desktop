@@ -3,6 +3,13 @@
 .env.local
 .env.*.local
 
+# Local runtime config (contains secrets / endpoints; use config.ini.example)
+config.ini
+
+# Editor / stray backups
+*.backup
+*.bak
+
 # Certificates / keys (never commit)
 *.pem
 *.crt

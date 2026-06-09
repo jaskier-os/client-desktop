@@ -6,10 +6,8 @@ import os
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-    QCheckBox, QPushButton,
+    QLineEdit, QComboBox, QCheckBox, QPushButton,
 )
-
-from src import config
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +27,7 @@ Hidden=false
 X-GNOME-Autostart-enabled=true
 """
 
+MODEL_OPTIONS = ["sonnet", "opus", "haiku"]
 MODEL_DISPLAY = {"sonnet": "Sonnet", "opus": "Opus", "haiku": "Haiku"}
 
 STYLESHEET = """
@@ -113,15 +112,12 @@ QPushButton#cancel_btn:hover {
 
 
 class SettingsDialog(QDialog):
-    """Config viewer dialog with Gruvbox dark theme.
+    """Config editor dialog with Gruvbox dark theme."""
 
-    The orchestrator endpoint, model, TURN server, and optional TLS certificate
-    are configured via environment variables / the `.env` file (see config.py).
-    This dialog shows the active connection settings and manages launch-on-startup.
-    """
-
-    def __init__(self, parent=None):
+    def __init__(self, config_path, config, parent=None):
         super().__init__(parent)
+        self._config_path = config_path
+        self._config = config
 
         self.setWindowTitle("Settings")
         self.setFixedWidth(420)
@@ -132,23 +128,41 @@ class SettingsDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(24, 24, 24, 24)
 
-        # Active orchestrator endpoint (read-only, configured via .env)
-        layout.addWidget(QLabel("Orchestrator endpoint"))
-        endpoint = QLabel(config.ORCHESTRATOR_WS_URL)
-        endpoint.setWordWrap(True)
-        layout.addWidget(endpoint)
+        # Orchestrator URL
+        layout.addWidget(QLabel("Orchestrator URL"))
+        self._url_input = QLineEdit()
+        self._url_input.setText(self._config.get("orchestrator", "api_url", fallback=""))
+        layout.addWidget(self._url_input)
 
-        # Active model (read-only, configured via ORCHESTRATOR_MODEL)
+        # Remote transcription
+        self._remote_check = QCheckBox("Use remote transcription service")
+        self._remote_check.setChecked(self._config.getboolean("transcription", "remote", fallback=False))
+        self._remote_check.toggled.connect(self._on_remote_toggled)
+        layout.addWidget(self._remote_check)
+
+        # Transcription URL
+        layout.addWidget(QLabel("Transcription URL"))
+        self._transcription_input = QLineEdit()
+        self._transcription_input.setText(self._config.get("transcription", "url", fallback=""))
+        self._transcription_input.setEnabled(self._remote_check.isChecked())
+        layout.addWidget(self._transcription_input)
+
+        # API Key
+        layout.addWidget(QLabel("API Key"))
+        self._key_input = QLineEdit()
+        self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_input.setText(self._config.get("orchestrator", "api_key", fallback=""))
+        layout.addWidget(self._key_input)
+
+        # Model
         layout.addWidget(QLabel("Model"))
-        model_name = MODEL_DISPLAY.get(config.ORCHESTRATOR_MODEL, config.ORCHESTRATOR_MODEL)
-        layout.addWidget(QLabel(model_name))
-
-        # TLS status (read-only)
-        cert = config.resolve_tls_cert()
-        tls_status = f"TLS CA: {cert}" if cert else "TLS: system trust / plain connection"
-        layout.addWidget(QLabel(tls_status))
-
-        layout.addWidget(QLabel("Edit the .env file to change connection settings."))
+        self._model_combo = QComboBox()
+        for key in MODEL_OPTIONS:
+            self._model_combo.addItem(MODEL_DISPLAY[key], key)
+        current_model = self._config.get("orchestrator", "model", fallback="sonnet")
+        idx = MODEL_OPTIONS.index(current_model) if current_model in MODEL_OPTIONS else 0
+        self._model_combo.setCurrentIndex(idx)
+        layout.addWidget(self._model_combo)
 
         # Launch on startup
         self._autostart_check = QCheckBox("Launch on startup")
@@ -174,7 +188,26 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(save_btn)
         layout.addLayout(btn_layout)
 
+    def _on_remote_toggled(self, checked):
+        self._transcription_input.setEnabled(checked)
+
     def _save(self):
+        # Write values to config
+        if not self._config.has_section("orchestrator"):
+            self._config.add_section("orchestrator")
+        self._config.set("orchestrator", "api_url", self._url_input.text())
+        self._config.set("orchestrator", "api_key", self._key_input.text())
+        self._config.set("orchestrator", "model", self._model_combo.currentData())
+
+        if not self._config.has_section("transcription"):
+            self._config.add_section("transcription")
+        self._config.set("transcription", "remote", str(self._remote_check.isChecked()).lower())
+        self._config.set("transcription", "url", self._transcription_input.text())
+
+        with open(self._config_path, "w", encoding="utf-8") as f:
+            self._config.write(f)
+        log.info("Settings saved to %s", self._config_path)
+
         # Autostart
         if self._autostart_check.isChecked():
             os.makedirs(AUTOSTART_DIR, exist_ok=True)
