@@ -5,6 +5,10 @@ WebSocket and lets a remote peer drive this machine: mouse, keyboard, audio,
 screen, and webcam, streamed over WebRTC. Runs as a PyQt6 tray app. Linux-
 oriented (uses `evdev` for input injection).
 
+The repo also carries a local voice-listener (speech-to-text, speaker
+verification, TTS, spectrogram overlay) under `src/`. It's kept for future use
+but is not wired into `main.py` — the relay is the active path.
+
 ## Run
 
 `run.sh` creates a venv, installs deps, and starts the app:

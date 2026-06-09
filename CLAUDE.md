@@ -10,9 +10,13 @@ keyboard, audio, screen, and webcam -- streamed over WebRTC. Linux-oriented:
 input injection uses `evdev`. It runs locally on the controlled machine, not in
 the Kubernetes cluster.
 
-This repo is the relay client. There is no speech-to-text here -- any old
-"voice listener / Whisper / Vosk" code was dead and removed during migration.
-Do not reintroduce or describe it.
+The relay is the active product: `main.py` wires up only the orchestrator
+client plus the mouse/keyboard relay. A separate voice-listener (local
+speech-to-text, speaker verification, TTS playback, spectrogram overlay) lives
+in the repo under `src/` but is intentionally NOT wired into `main.py` right
+now -- it is kept for future use, not deleted. Prioritize the relay path; leave
+the voice-listener modules in place, but don't depend on them from `main.py`
+unless explicitly asked to re-enable them.
 
 For the whole-system map (orchestrator architecture, the full port map, every
 service), see the `jaskier-os/orchestrator` repo and its CLAUDE.md / docs rather
@@ -27,7 +31,11 @@ than duplicating it here.
 - `src/audio_relay.py`, `src/screen_streamer.py`, `src/webcam.py`,
   `src/screenshot.py` -- capture/stream sources.
 - `src/config.py` -- env-var config loading.
-- `src/tray.py`, `src/settings_dialog.py` -- PyQt6 UI.
+- `src/tray.py`, `src/settings_dialog.py`, `src/widget.py` -- PyQt6 UI.
+
+Voice-listener modules (present but NOT wired into `main.py`; kept for future
+use): `src/transcriber.py`, `src/recorder.py`, `src/speaker_verifier.py`,
+`src/audio_monitor.py`, `src/spectrogram.py`, `src/tts_player.py`.
 
 ## Build / run
 
