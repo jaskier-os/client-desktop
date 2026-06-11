@@ -1,5 +1,7 @@
 # client-desktop
 
+> **Docs & wiki:** [github.com/jaskier-os/docs/wiki](https://github.com/jaskier-os/docs/wiki)
+
 Python desktop relay client. Connects to the backend orchestrator over
 WebSocket and lets a remote peer drive this machine: mouse, keyboard, audio,
 screen, and webcam, streamed over WebRTC. Runs as a PyQt6 tray app. Linux-
