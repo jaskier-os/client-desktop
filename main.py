@@ -45,6 +45,7 @@ class ListenerApp:
         ws_url = cfg.get("orchestrator", "ws_url", fallback="ws://localhost:10001/ws/device")
         self._orchestrator = OrchestratorClient(ws_url, device_id="desktop-listener", model=model)
         self._orchestrator.on_mouse_event = self._mouse_relay.handle_event
+        self._orchestrator.on_mouse_abs_event = self._mouse_relay.handle_abs_event
         self._orchestrator.on_keyboard_event = self._keyboard_relay.handle_event
         self._orchestrator.on_audio_relay_start = self._on_audio_relay_start
         self._orchestrator.on_audio_relay_stop = self._on_audio_relay_stop

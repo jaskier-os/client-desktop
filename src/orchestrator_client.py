@@ -125,6 +125,7 @@ class OrchestratorClient:
         self.on_disconnected = None
         self.on_device_command = None
         self.on_mouse_event = None
+        self.on_mouse_abs_event = None
         self.on_keyboard_event = None  # callback(text: str)
         self.on_audio_relay_start = None  # callback(bitrate, buffer_seconds)
         self.on_audio_relay_stop = None   # callback()
@@ -399,6 +400,12 @@ class OrchestratorClient:
                     buttons = data[5]
                     scroll = struct.unpack('>b', data[6:7])[0]
                     self.on_mouse_event(dx, dy, buttons, scroll)
+                elif len(data) == 8 and data[0] == 0x03 and self.on_mouse_abs_event:
+                    monitor = data[1]
+                    norm_x = struct.unpack('>H', data[2:4])[0]
+                    norm_y = struct.unpack('>H', data[4:6])[0]
+                    buttons = data[6]
+                    self.on_mouse_abs_event(monitor, norm_x, norm_y, buttons)
         elif stream_type == "keyboard":
             on_binary = self._handle_keyboard_frame
 
