@@ -53,6 +53,13 @@ TURN_CREDENTIAL = get("TURN_CREDENTIAL")
 # Optional override for the public STUN server.
 STUN_URL = get("STUN_URL", "stun:stun.l.google.com:19302")
 
+# LAN-direct audio relay. When the phone is on the same network it can connect
+# its audio-relay signaling straight to this desktop (skipping the cloud hop).
+# The desktop runs a small local WebSocket server on this port and advertises it
+# over mDNS. Set LOCAL_RELAY_ENABLED=false to disable both.
+LOCAL_RELAY_ENABLED = get("LOCAL_RELAY_ENABLED", "true").lower() not in ("0", "false", "no")
+LOCAL_RELAY_PORT = int(get("LOCAL_RELAY_PORT", "10101"))
+
 
 def resolve_tls_cert():
     """Return an existing TLS cert path, or None if unset/missing.

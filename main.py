@@ -14,8 +14,10 @@ from src.orchestrator_client import OrchestratorClient
 from src.mouse_relay import MouseRelay
 from src.keyboard_relay import KeyboardRelay
 from src.audio_relay import AudioRelay
+from src.local_relay_server import LocalRelayServer
+from src.mdns_advertiser import MdnsAdvertiser
 from src.tray import TrayIcon
-from src import async_bridge
+from src import async_bridge, config
 
 log = logging.getLogger("listener")
 
@@ -52,9 +54,25 @@ class ListenerApp:
         self._orchestrator.on_audio_relay_config = self._on_audio_relay_config
         self._orchestrator._audio_relay = self._audio_relay
 
+        # LAN-direct audio relay: local signaling server + mDNS advertisement.
+        # Lets a same-network phone skip the cloud hop for audio streaming.
+        self._local_relay = None
+        self._mdns = None
+        if config.LOCAL_RELAY_ENABLED:
+            self._local_relay = LocalRelayServer(
+                self._audio_relay,
+                port=config.LOCAL_RELAY_PORT,
+                capture_in_use_elsewhere=lambda: self._orchestrator._webrtc_peer is not None,
+            )
+            self._mdns = MdnsAdvertiser(config.LOCAL_RELAY_PORT, device_id="desktop-listener")
+
     def start(self):
         async_bridge.start()
         self._orchestrator.connect()
+        if self._local_relay:
+            self._local_relay.start()
+        if self._mdns:
+            self._mdns.start()
         if self._mouse_relay.start():
             log.info("Mouse relay started")
         else:
@@ -67,6 +85,10 @@ class ListenerApp:
 
     def shutdown(self):
         log.info("Shutting down...")
+        if self._mdns:
+            self._mdns.stop()
+        if self._local_relay:
+            self._local_relay.stop()
         self._orchestrator.disconnect()
         self._mouse_relay.stop()
         self._keyboard_relay.stop()
@@ -93,8 +115,15 @@ class ListenerApp:
         log.debug("Audio relay config update ignored (WebRTC handles buffering): buffer=%.1fs", buffer_seconds)
 
     def _on_audio_relay_stop(self):
-        """Called when phone stops desktop audio relay."""
+        """Called when phone stops desktop audio relay (cloud path)."""
         log.info("Audio relay stop requested")
+        # The capture is shared with the LAN-direct path; a cloud stop must not
+        # kill audio underneath a live LAN session (the phone stops the cloud
+        # session right before starting a LAN one, and the two messages travel
+        # over different sockets so they can arrive in either order).
+        if self._local_relay is not None and self._local_relay.session_active:
+            log.info("Audio relay stop skipped: LAN-direct session active")
+            return
         self._audio_relay.stop()
 
 

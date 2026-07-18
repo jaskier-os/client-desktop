@@ -17,6 +17,46 @@ aioice.ice.CONSENT_FAILURES = 999999
 log = logging.getLogger(__name__)
 
 
+def _tune_opus_encoder_for_congested_wifi():
+    """Reconfigure aiortc's Opus encoder for full-quality music/system audio
+    with light loss resilience on a busy 2.4GHz link.
+
+    This relays arbitrary system audio (music included), so quality is the
+    priority. aiortc defaults to 96kbps stereo but with application 'voip'
+    (speech-optimised: band-limited, aggressive processing) and no loss
+    resilience. We keep the full 96kbps stereo and switch to:
+      - application 'audio': music/general fidelity, NOT speech processing
+      - in-band FEC: the phone reconstructs a lost frame from the next one,
+        masking the short gaps a congested link produces -- cheap, no quality cost
+    We deliberately do NOT enable DTX (it chops continuous/music audio) and do
+    NOT lower the bitrate (that was what wrecked quality). Patched at import so
+    every OpusEncoder aiortc creates picks it up; we never edit the venv files.
+    """
+    try:
+        from aiortc.codecs import opus as _opus
+
+        _orig_init = _opus.OpusEncoder.__init__
+
+        def _patched_init(self):
+            _orig_init(self)
+            self.codec.bit_rate = 96000
+            opts = dict(getattr(self.codec, "options", {}) or {})
+            opts.update({
+                "application": "audio",  # music/general fidelity, not speech
+                "fec": "on",             # in-band forward error correction
+                "packet_loss": "5",      # expect a little loss -> enables FEC
+            })
+            self.codec.options = opts
+
+        _opus.OpusEncoder.__init__ = _patched_init
+        log.info("Opus encoder tuned for quality (96kbps stereo, audio mode, FEC)")
+    except Exception as e:
+        log.warning("Could not tune Opus encoder: %s", e)
+
+
+_tune_opus_encoder_for_congested_wifi()
+
+
 def _build_ice_servers():
     """Assemble ICE servers from environment config.
 
@@ -45,20 +85,27 @@ class DesktopWebRTCPeer:
     bundling them into the SDP. No trickle ICE is used on the desktop side.
     """
 
-    def __init__(self, stream_id, send_signaling, on_closed=None):
+    def __init__(self, stream_id, send_signaling, on_closed=None, ice_servers=None):
         """
         Args:
             stream_id: Stream session ID from orchestrator
             send_signaling: Callback to send signaling JSON via main WS.
                            Called with (msg_type, payload_dict).
             on_closed: Optional callback invoked when connection fails/closes.
+            ice_servers: Override the ICE server list. Pass an empty list for a
+                         same-LAN peer so aiortc gathers only host candidates and
+                         does not block ~5s waiting for a STUN reply that a
+                         local-network peer never needs.
         """
         self._stream_id = stream_id
         self._send_signaling = send_signaling
         self._on_closed = on_closed
-        self._pc = RTCPeerConnection(RTCConfiguration(iceServers=ICE_SERVERS))
+        servers = ICE_SERVERS if ice_servers is None else ice_servers
+        self._pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
         self._pc.on("connectionstatechange", self._on_connection_state_change)
         self._audio_track = None
+        self._closed = False
+        self._close_task = None
         log.info("WebRTC peer created for stream %d", stream_id)
 
     def _on_connection_state_change(self):
@@ -66,6 +113,13 @@ class DesktopWebRTCPeer:
         log.info("WebRTC connection state: %s (stream %d)", state, self._stream_id)
         if state in ("failed", "closed"):
             log.warning("WebRTC connection %s for stream %d", state, self._stream_id)
+            # Explicitly close to stop the audio track (releasing its hold on the
+            # shared PCM queue) and release UDP sockets. This handler already runs
+            # on the event loop, so schedule close() as a task on the running loop
+            # rather than going through async_bridge. Without this, a dead peer's
+            # track keeps draining the shared queue and starves the live stream.
+            # Hold a strong ref so the GC cannot destroy the close task mid-await.
+            self._close_task = asyncio.ensure_future(self.close())
             if self._on_closed:
                 self._on_closed(self)
 
@@ -101,8 +155,14 @@ class DesktopWebRTCPeer:
         log.info("WebRTC answer set for stream %d", self._stream_id)
 
     async def close(self):
-        """Close the peer connection."""
+        """Close the peer connection and release all UDP sockets. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
         if self._audio_track:
             self._audio_track.stop()
-        await self._pc.close()
+        try:
+            await self._pc.close()
+        except Exception as e:
+            log.warning("WebRTC peer close error (stream %d): %s", self._stream_id, e)
         log.info("WebRTC peer closed for stream %d", self._stream_id)
