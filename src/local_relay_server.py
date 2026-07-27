@@ -251,10 +251,12 @@ class LocalRelayServer:
                 self._peer = None
                 # No consumer left on this transport (e.g. the phone never answered and
                 # the peer timed out). Release the capture so parec and its thread don't
-                # keep running with nobody reading them.
-                gen = self._audio_relay.generation
+                # keep running with nobody reading them. Use THIS session's generation,
+                # threaded in from its start: reading it here would always equal the
+                # newest session's value, so the guard could never refuse a stale
+                # teardown and a late peer death would stop a live session's capture.
                 threading.Thread(
-                    target=lambda: self._audio_relay.release_and_stop("lan", generation=gen),
+                    target=lambda: self._audio_relay.release_and_stop("lan", generation=my_gen),
                     daemon=True,
                     name="audio-relay-stop",
                 ).start()

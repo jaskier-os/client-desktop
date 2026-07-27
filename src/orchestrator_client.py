@@ -486,6 +486,12 @@ class OrchestratorClient:
                      stream_id, self._audio_relay.owner)
             return
 
+        # This session's generation, captured now. Reading it inside the callback would
+        # always equal the NEWEST session's value, so the guard could never refuse a
+        # stale teardown -- a peer that died late would stop the capture a retried
+        # session had just started, and the token would be left unowned.
+        session_gen = self._audio_relay.generation
+
         def _on_peer_closed(closed_peer):
             if self._webrtc_peer is closed_peer:
                 log.info("WebRTC peer closed, clearing reference for stream %d", stream_id)
@@ -494,9 +500,10 @@ class OrchestratorClient:
                 # phone never answered and the peer timed out); release it so parec
                 # and its thread don't keep running with no reader.
                 if self._audio_relay is not None:
-                    gen = self._audio_relay.generation
                     threading.Thread(
-                        target=lambda: self._audio_relay.release_and_stop("cloud", generation=gen),
+                        target=lambda: self._audio_relay.release_and_stop(
+                            "cloud", generation=session_gen
+                        ),
                         daemon=True,
                         name="audio-relay-stop",
                     ).start()
@@ -532,9 +539,10 @@ class OrchestratorClient:
                 # cleared, so release the token here -- otherwise the capture stays
                 # pinned with no consumer and the ownership gate blocks the LAN path.
                 if self._audio_relay is not None:
-                    gen = self._audio_relay.generation
                     threading.Thread(
-                        target=lambda: self._audio_relay.release_and_stop("cloud", generation=gen),
+                        target=lambda: self._audio_relay.release_and_stop(
+                            "cloud", generation=session_gen
+                        ),
                         daemon=True,
                         name="audio-relay-stop",
                     ).start()

@@ -521,7 +521,48 @@ def test_orphan_stop_uses_the_sessions_own_generation():
     assert cloud_proc.terminated
     print("PASS: the abandon-path stop is scoped to its own session")
 
+
+def test_late_peer_death_cannot_stop_a_retried_session():
+    """A peer that dies late must not tear down the session that replaced it.
+
+    The phone retries while the first peer is still installed (a duplicate initiate is
+    ignored, so it is never replaced). When that first peer's answer watchdog finally
+    fires, its teardown must be refused -- reading the generation at close time instead
+    of capturing it at creation makes it always match, so the dead peer stops the live
+    session's capture and leaves the token unowned. Every later initiate is then refused
+    and audio is dead until restart.
+    """
+    relay = AudioRelay()
+
+    # Session 1 claims and starts; capture ITS generation, as the peer closure does.
+    relay.claim("cloud")
+    relay._parec_proc = FakeProc()
+    relay._running = True
+    _ok, session1_gen = relay.start_versioned(64000)
+
+    # Session 2: the phone retries. The capture is reused, so the generation advances
+    # while session 1's peer is still installed.
+    relay.claim("cloud")
+    _ok2, _session2_gen = relay.start_versioned(64000)
+    live_proc = relay._parec_proc
+
+    # Session 1's watchdog fires now, using the generation it captured at creation.
+    killed = relay.release_and_stop("cloud", generation=session1_gen)
+    assert killed is False, (
+        "REGRESSION: a late peer death tore down the session that replaced it"
+    )
+    assert not live_proc.terminated, (
+        "REGRESSION: the retried session's capture was stopped by a dead peer -- "
+        "the phone would hear silence with no error and no retry"
+    )
+    assert relay.owner == "cloud", (
+        "REGRESSION: ownership was cleared, so every later initiate is refused and "
+        "audio stays dead until restart"
+    )
+    print("PASS: a late peer death cannot stop the session that replaced it")
+
 if __name__ == "__main__":
+    test_late_peer_death_cannot_stop_a_retried_session()
     test_orphan_stop_uses_the_sessions_own_generation()
     test_shutdown_refuses_a_late_start()
     test_start_versioned_generation_is_usable_for_release()
