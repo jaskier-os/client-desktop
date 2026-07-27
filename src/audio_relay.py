@@ -31,6 +31,74 @@ class AudioRelay:
         self._running = False
         self._monitor_device = None
         self._pcm_queue = queue.Queue(maxsize=self.PCM_QUEUE_MAXSIZE)
+        # start()/stop() are called from both the Qt thread and async executor
+        # threads. Without this lock two concurrent starts each spawn a parec and
+        # the first is orphaned for the process lifetime (its capture thread keeps
+        # racing the second one on the same queue).
+        self._lock = threading.RLock()
+        # Which transport currently owns the capture ("cloud" / "lan" / None). A single
+        # token is the only reliable arbiter: the two transports otherwise each check
+        # the other's "am I streaming" predicate, and both can answer False during the
+        # seconds-wide window between deciding to start and installing their peer --
+        # so both attach a track and split the 50fps queue (halved frame rate).
+        self._owner = None
+        self._generation = 0
+
+    @property
+    def owner(self):
+        return self._owner
+
+    def claim(self, owner):
+        """Claim capture ownership. Returns the previous owner, if any."""
+        with self._lock:
+            previous = self._owner
+            self._owner = owner
+            return previous
+
+    def release_and_stop_if(self, owner, predicate):
+        """Release+stop only if `owner` holds the capture AND `predicate()` is True.
+
+        The predicate runs UNDER the lock so a caller that must consult external state
+        (e.g. "is a peer streaming?") cannot be overtaken between checking and acting --
+        which would kill the capture of the session that appeared in that gap.
+        """
+        with self._lock:
+            if self._owner != owner or not predicate():
+                return False
+            self._owner = None
+            self._stop_locked()
+            return True
+
+    def release(self, owner):
+        """Release ownership if still held by `owner`. Returns True if released."""
+        with self._lock:
+            if self._owner == owner:
+                self._owner = None
+                return True
+            return False
+
+    def release_and_stop(self, owner, generation=None):
+        """Atomically release ownership and stop the capture if `owner` still held it.
+
+        Doing this as two steps lets the other transport claim and start in between,
+        and the stop then terminates that fresh capture under a live peer -- the phone
+        connects and hears pure silence with no error to trigger a retry.
+
+        `generation` guards the delayed callers (peer-death threads, executor hops):
+        the SAME owner name can legitimately belong to a newer session by the time the
+        call runs, so owner identity alone is not enough. Returns True if this owner
+        held the capture at that generation and it was stopped.
+        """
+        with self._lock:
+            if self._owner != owner:
+                return False
+            if generation is not None and generation != self._generation:
+                log.info("Audio relay: ignoring stale release_and_stop (gen %s, current %s)",
+                         generation, self._generation)
+                return False
+            self._owner = None
+            self._stop_locked()
+            return True
 
     @property
     def pcm_queue(self):
@@ -39,9 +107,26 @@ class AudioRelay:
 
     def start(self, bitrate=64000, buffer_seconds=None):
         """Start audio capture. Returns True on success, False on failure."""
+        with self._lock:
+            return self._start_locked()
+
+    def _start_locked(self):
         if self._running:
-            log.warning("Audio relay already running")
+            # Bump the generation even though the capture is reused: a stop captured
+            # against the OLD generation is on its way (peer death schedules it on a
+            # thread), and without this bump it would match and terminate parec under
+            # the session that just claimed it -- pure silence, no error, no retry.
+            self._generation += 1
+            log.warning("Audio relay already running (generation now %d)", self._generation)
             return True
+
+        # _running is also cleared by the capture loop when it exits on a read error,
+        # leaving parec alive. Reap that remnant first, otherwise this start would
+        # Popen a second one and overwrite the handle, orphaning the old process
+        # (and its thread) on the shared queue for the app's lifetime.
+        if self._parec_proc is not None or self._capture_thread is not None:
+            log.warning("Audio relay: reaping remnants of a previous capture before start")
+            self._stop_locked()
 
         # Detect PulseAudio monitor device
         self._monitor_device = self._detect_monitor()
@@ -74,16 +159,38 @@ class AudioRelay:
             return False
 
         self._running = True
+        self._generation += 1
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
         log.info("Audio relay started: device=%s frame=%dms",
                  self._monitor_device, self.FRAME_DURATION_MS)
         return True
 
-    def stop(self):
-        """Stop audio capture."""
-        if not self._running:
-            return
+    def stop(self, generation=None):
+        """Stop audio capture.
+
+        `generation` makes the stop conditional: executor-offloaded stops can land
+        AFTER a newer start (the lock serializes but does not order them), and would
+        then terminate the fresh parec under a live peer -- the phone connects and
+        hears pure silence, with no error to trigger a retry.
+        """
+        with self._lock:
+            if generation is not None and generation != self._generation:
+                log.info("Audio relay: ignoring stale stop (gen %s, current %s)",
+                         generation, self._generation)
+                return
+            self._stop_locked()
+
+    @property
+    def generation(self):
+        """Increments on every start; identifies the current capture instance."""
+        return self._generation
+
+    def _stop_locked(self):
+        # Do NOT early-return on `not _running`: the capture loop clears that flag
+        # when it exits (including on a read error, with parec still alive). Gating
+        # on it would skip terminate()/join() and orphan the process for the app
+        # lifetime, while the next start() spawns yet another one.
         self._running = False
 
         if self._parec_proc:
@@ -99,7 +206,12 @@ class AudioRelay:
 
         if self._capture_thread:
             self._capture_thread.join(timeout=3)
-            self._capture_thread = None
+            if self._capture_thread.is_alive():
+                # Keep the handle so the next start() reaps it instead of leaving a
+                # second thread racing the new one on the shared queue.
+                log.warning("Audio relay: capture thread did not exit within 3s")
+            else:
+                self._capture_thread = None
 
         # Drain queue
         while not self._pcm_queue.empty():

@@ -26,6 +26,7 @@ only one path is ever active at a time because the phone picks one.
 import asyncio
 import json
 import logging
+import threading
 
 import websockets
 
@@ -43,19 +44,17 @@ class LocalRelayServer:
     the loop with the rest of aiortc. A single phone client is served at a time.
     """
 
-    def __init__(self, audio_relay, host="0.0.0.0", port=10101, capture_in_use_elsewhere=None):
+    def __init__(self, audio_relay, host="0.0.0.0", port=10101, close_other_transport=None):
         """
         Args:
             audio_relay: Shared AudioRelay (single parec capture).
-            capture_in_use_elsewhere: Optional callable returning True while the
-                cloud path has a live WebRTC peer consuming the shared capture.
-                Teardown then leaves the capture running so we never kill audio
-                under the other transport.
+            close_other_transport: Called to evict the cloud path when this one
+                takes ownership of the shared capture.
         """
         self._audio_relay = audio_relay
         self._host = host
         self._port = port
-        self._capture_in_use_elsewhere = capture_in_use_elsewhere or (lambda: False)
+        self._close_other_transport = close_other_transport or (lambda: None)
         self._server = None
         self._peer = None
         self._ws = None
@@ -63,11 +62,6 @@ class LocalRelayServer:
         # Strong refs to in-flight fire-and-forget send tasks so the GC cannot
         # destroy them mid-await.
         self._pending_tasks = set()
-
-    @property
-    def session_active(self):
-        """True while a phone is connected with a live LAN WebRTC peer."""
-        return self._peer is not None
 
     def start(self):
         """Start the server on the shared async loop (call after async_bridge.start())."""
@@ -84,6 +78,9 @@ class LocalRelayServer:
         # Serve one phone at a time. A new connection replaces any stale one.
         if self._ws is not None:
             log.info("Local relay: new phone connection, tearing down previous session")
+            # Claim ownership before awaiting so the connection being replaced
+            # sees itself as stale and skips its own teardown.
+            self._ws = ws
             await self._teardown()
         self._ws = ws
         peer = ws.remote_address[0] if ws.remote_address else "?"
@@ -97,9 +94,16 @@ class LocalRelayServer:
             log.error("Local relay: connection error: %s", e)
         finally:
             log.info("Local relay: phone disconnected from %s", peer)
-            await self._teardown()
+            # Only tear down if this connection still owns the session. A phone
+            # reconnect installs a newer ws (and a fresh peer/capture) before this
+            # handler unwinds; tearing down here would stop the shared AudioRelay
+            # out from under the live session, killing audio and making the phone
+            # reconnect again -- an endless reconnect loop.
             if self._ws is ws:
                 self._ws = None
+                await self._teardown()
+            else:
+                log.info("Local relay: stale connection closed, keeping live session")
 
     async def _on_message(self, ws, raw):
         try:
@@ -108,6 +112,14 @@ class LocalRelayServer:
             log.error("Local relay: bad JSON from phone")
             return
         msg_type = env.get("type", "")
+
+        # Ignore anything still buffered on a superseded connection. The phone
+        # reconnects on a new socket, so a late audio_relay_stop (or a second
+        # audio_relay_start) arriving on the old one would tear down or replace
+        # the live session's capture and peer.
+        if self._ws is not ws:
+            log.debug("Local relay: ignoring %s from stale connection", msg_type)
+            return
 
         if msg_type == "identify":
             log.info("Local relay: identify from %s (%s)", env.get("deviceId", "?"), env.get("deviceType", "?"))
@@ -136,12 +148,23 @@ class LocalRelayServer:
         buffer_seconds = env.get("desktopBuffer", 1.0)
         log.info("Local relay: audio_relay_start bitrate=%d buffer=%.1fs", bitrate, buffer_seconds)
 
+        # Claim the capture atomically FIRST, then evict the previous owner. Doing it in
+        # this order closes the window between deciding to start and installing our peer
+        # (device detection alone can take seconds), during which both transports' "is
+        # the other streaming" predicates read False and both attach a track.
+        previous = self._audio_relay.claim("lan")
+        if previous == "cloud":
+            self._close_other_transport()
+
         loop = asyncio.get_running_loop()
         started = await loop.run_in_executor(
             None, lambda: self._audio_relay.start(bitrate, buffer_seconds=buffer_seconds)
         )
         if not started:
             log.error("Local relay: AudioRelay failed to start")
+            # Give the claim back, otherwise ownership is pinned to a transport that
+            # never started and no later stop can ever release the capture.
+            self._audio_relay.release("lan")
             await self._safe_send({"type": "audio_relay_error", "reason": "no_monitor_device"})
             return
 
@@ -164,6 +187,13 @@ class LocalRelayServer:
             self._peer = None
             await old.close()
 
+        # The cloud path may have taken the capture while _start_relay was suspended in
+        # its executor hop. Attaching a track anyway would put two consumers on the
+        # shared queue -- each transport then gets half the frames (audible stutter).
+        if self._audio_relay.owner != "lan":
+            log.info("Local relay: skipping offer, capture owned by '%s'", self._audio_relay.owner)
+            return
+
         self._stream_id += 1
         stream_id = self._stream_id
 
@@ -171,6 +201,15 @@ class LocalRelayServer:
             if self._peer is closed_peer:
                 log.info("Local relay: peer closed, clearing reference for stream %d", stream_id)
                 self._peer = None
+                # No consumer left on this transport (e.g. the phone never answered and
+                # the peer timed out). Release the capture so parec and its thread don't
+                # keep running with nobody reading them.
+                gen = self._audio_relay.generation
+                threading.Thread(
+                    target=lambda: self._audio_relay.release_and_stop("lan", generation=gen),
+                    daemon=True,
+                    name="audio-relay-stop",
+                ).start()
 
         # Host-only ICE (no STUN): both peers are on the same LAN, so waiting for
         # a STUN reply just delays the offer ~5s. Empty server list -> aiortc
@@ -184,6 +223,24 @@ class LocalRelayServer:
             log.error("Local relay: create offer failed: %s", e)
             if self._peer is peer:
                 self._peer = None
+            await peer.close()
+            # _on_peer_closed's identity guard is False now that _peer was cleared, so
+            # nothing else releases the token. Leaving it held pins the capture with no
+            # consumer AND makes the ownership gate refuse every later cloud initiate --
+            # cloud audio would be dead until restart.
+            loop = asyncio.get_running_loop()
+            gen_fail = self._audio_relay.generation
+            await loop.run_in_executor(
+                None, lambda: self._audio_relay.release_and_stop("lan", generation=gen_fail)
+            )
+            return
+
+        # We yielded during the offer; if another thread swapped or cleared the peer
+        # meanwhile (close_session, a newer offer, teardown), this one is orphaned and
+        # nobody holds a reference to close it -- it would stream from the shared
+        # capture forever. Close it here.
+        if self._peer is not peer:
+            log.info("Local relay: stream %d superseded during offer, closing orphan", stream_id)
             await peer.close()
 
     async def _set_answer(self, env):
@@ -228,10 +285,36 @@ class LocalRelayServer:
                 pass
         # The AudioRelay capture is shared with the cloud path -- only stop it
         # if no other transport is actively streaming from it.
-        if self._capture_in_use_elsewhere():
-            log.info("Local relay: leaving shared audio capture running (in use by cloud path)")
-        else:
-            self._audio_relay.stop()
+        # release+stop must be atomic: the cloud path can claim and start in between,
+        # and the stop would then kill that fresh capture under a live peer. Offloaded
+        # because stop() blocks up to ~5s and this runs on the shared asyncio loop --
+        # inline it would stall ICE/DTLS/WS keepalives and make the phone drop.
+        loop = asyncio.get_running_loop()
+        gen = self._audio_relay.generation
+        stopped = await loop.run_in_executor(
+            None, lambda: self._audio_relay.release_and_stop("lan", generation=gen)
+        )
+        if not stopped:
+            log.info("Local relay: leaving shared audio capture running (owned by cloud path)")
+
+    def close_session(self):
+        """Close the LAN WebRTC peer, leaving the shared capture and server running.
+
+        Used when the cloud path takes over: the LAN peer's audio track would
+        otherwise keep consuming the shared PCM queue alongside the cloud one.
+        """
+        peer = self._peer
+        if peer is None:
+            return
+        self._peer = None
+
+        async def _close():
+            try:
+                await peer.close()
+            except Exception:
+                pass
+
+        async_bridge.run_coro(_close())
 
     def stop(self):
         """Stop the server (called on app shutdown)."""

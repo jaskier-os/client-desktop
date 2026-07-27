@@ -129,6 +129,7 @@ class OrchestratorClient:
         self.on_keyboard_event = None  # callback(text: str)
         self.on_audio_relay_start = None  # callback(bitrate, buffer_seconds)
         self.on_audio_relay_stop = None   # callback()
+        self.on_webrtc_initiated = None   # callback() -- a cloud peer is being created
         self.on_audio_relay_config = None  # callback(buffer_seconds)
 
     def _ssl_options(self):
@@ -464,11 +465,36 @@ class OrchestratorClient:
             log.error("Cannot initiate WebRTC -- no audio relay available")
             return
 
+        # The LAN path may have taken the capture between the cloud start and this
+        # (round-trip delayed) initiate. Attaching a track anyway would put two
+        # consumers on the shared queue -- each transport then gets half the frames,
+        # which the phone hears as constant stutter.
+        # Require the cloud to ALREADY own the capture. Accepting owner=None used to let
+        # a delayed initiate attach a track after the LAN path had released everything;
+        # the next LAN session then claimed and started while that orphan track was still
+        # draining the queue -- two consumers, 25fps each.
+        if self._audio_relay.owner != "cloud":
+            log.info("Ignoring webrtc_initiate for stream %d: capture owned by '%s'",
+                     stream_id, self._audio_relay.owner)
+            return
+
         def _on_peer_closed(closed_peer):
             if self._webrtc_peer is closed_peer:
                 log.info("WebRTC peer closed, clearing reference for stream %d", stream_id)
                 self._webrtc_peer = None
+                # Nothing consumes the capture on this transport any more (e.g. the
+                # phone never answered and the peer timed out); release it so parec
+                # and its thread don't keep running with no reader.
+                if self._audio_relay is not None:
+                    gen = self._audio_relay.generation
+                    threading.Thread(
+                        target=lambda: self._audio_relay.release_and_stop("cloud", generation=gen),
+                        daemon=True,
+                        name="audio-relay-stop",
+                    ).start()
 
+        if self.on_webrtc_initiated:
+            self.on_webrtc_initiated()
         peer = DesktopWebRTCPeer(stream_id, self._send_signaling, on_closed=_on_peer_closed)
         self._webrtc_peer = peer
         audio_track = PulseAudioTrack(self._audio_relay.pcm_queue)
@@ -480,6 +506,24 @@ class OrchestratorClient:
                 # Close the failed peer to release file descriptors
                 if self._webrtc_peer is peer:
                     self._webrtc_peer = None
+                async_bridge.run_coro(peer.close())
+                # _on_peer_closed's identity guard is False now that _webrtc_peer was
+                # cleared, so release the token here -- otherwise the capture stays
+                # pinned with no consumer and the ownership gate blocks the LAN path.
+                if self._audio_relay is not None:
+                    gen = self._audio_relay.generation
+                    threading.Thread(
+                        target=lambda: self._audio_relay.release_and_stop("cloud", generation=gen),
+                        daemon=True,
+                        name="audio-relay-stop",
+                    ).start()
+                return
+            # Offer completed, but the peer may have been swapped or closed while it
+            # was in flight (close_webrtc_peer, a newer initiate). Nobody references
+            # this one any more, so close it or it streams from the shared capture
+            # forever.
+            if self._webrtc_peer is not peer:
+                log.info("Cloud stream %d superseded during offer, closing orphan", stream_id)
                 async_bridge.run_coro(peer.close())
 
         fut = async_bridge.run_coro(self._webrtc_peer.create_offer_with_audio(audio_track))
@@ -559,6 +603,32 @@ class OrchestratorClient:
                 request_id, cmd_type,
                 text=f"Unsupported device command: {cmd_type}. This device does not have this capability."
             )
+
+    @property
+    def is_streaming(self):
+        """True while the cloud peer is actually consuming the shared audio capture."""
+        peer = self._webrtc_peer
+        return peer is not None and peer.is_streaming
+
+    def close_webrtc_peer(self):
+        """Close the cloud WebRTC peer, if any, without touching the shared capture.
+
+        Used when the LAN-direct path takes over: the cloud peer's audio track would
+        otherwise stay live and keep consuming the shared PCM queue, halving the frame
+        rate the LAN peer receives.
+        """
+        peer = self._webrtc_peer
+        if peer is None:
+            return
+        self._webrtc_peer = None
+
+        async def _close():
+            try:
+                await peer.close()
+            except Exception:
+                pass
+
+        async_bridge.run_coro(_close())
 
     def _start_screen_stream(self, request_id, command):
         """Start screen streaming via FFmpeg."""
@@ -706,7 +776,12 @@ class OrchestratorClient:
                     await old_peer.close()
                 except Exception:
                     pass
-            async_bridge.run_coro(_close())
+            try:
+                async_bridge.run_coro(_close())
+            except Exception as e:
+                # The loop is already gone during shutdown; swallowing this keeps the
+                # cleanup below (screen streamer, capture release) from being skipped.
+                log.warning("Could not schedule peer close on disconnect: %s", e)
         if self._screen_streamer:
             self._screen_streamer.stop()
             self._screen_streamer = None

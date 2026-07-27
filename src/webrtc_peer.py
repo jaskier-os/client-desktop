@@ -17,6 +17,47 @@ aioice.ice.CONSENT_FAILURES = 999999
 log = logging.getLogger(__name__)
 
 
+# Interface-name prefixes that are never a real media path to the phone:
+# container bridges, virtual ethernet, VPN tunnels, WiFi-Direct, Hamachi/ZeroTier.
+# aiortc/aioice otherwise gathers a host candidate on EVERY interface, and the
+# phone will happily pair with the VPN-tunnel candidate (which is routable via
+# the Hetzner network) instead of the real LAN address -- hairpinning the audio
+# out over the internet and back even when both peers are on the same WiFi.
+_VIRTUAL_IFACE_PREFIXES = ("docker", "br-", "veth", "virbr", "p2p", "zt", "wg", "ham")
+
+
+def _restrict_host_candidates_to_physical():
+    """Make aioice gather host ICE candidates only on real physical/WiFi
+    interfaces. Patched at import; affects every peer. The LAN peer then offers
+    just the real LAN address, and the cloud peer still gets its srflx/TURN
+    candidates (those come from STUN/TURN, not from this host enumeration)."""
+    try:
+        import aioice.ice as _ice
+        import ifaddr
+
+        def _physical_host_addresses(use_ipv4, use_ipv6):
+            addresses = []
+            for adapter in ifaddr.get_adapters():
+                name = adapter.name
+                name = name.lower() if isinstance(name, str) else name.decode(errors="ignore").lower()
+                if name.startswith(_VIRTUAL_IFACE_PREFIXES):
+                    continue
+                for ip in adapter.ips:
+                    if isinstance(ip.ip, str) and use_ipv4 and ip.ip != "127.0.0.1":
+                        addresses.append(ip.ip)
+                    elif use_ipv6 and not isinstance(ip.ip, str) and ip.ip[0] != "::1" and ip.ip[2] == 0:
+                        addresses.append(ip.ip[0])
+            return addresses
+
+        _ice.get_host_addresses = _physical_host_addresses
+        log.info("ICE host candidates restricted to physical interfaces (no docker/vpn/hamachi)")
+    except Exception as e:
+        log.warning("Could not restrict ICE host candidates: %s", e)
+
+
+_restrict_host_candidates_to_physical()
+
+
 def _tune_opus_encoder_for_congested_wifi():
     """Reconfigure aiortc's Opus encoder for full-quality music/system audio
     with light loss resilience on a busy 2.4GHz link.
@@ -79,6 +120,10 @@ ICE_SERVERS = _build_ice_servers()
 
 
 class DesktopWebRTCPeer:
+    # How long an offered peer may wait for the phone's answer before it gives up
+    # its hold on the shared audio capture.
+    ANSWER_TIMEOUT = 20.0
+
     """Manages a single WebRTC peer connection for streaming to the phone.
 
     aiortc gathers all ICE candidates before createOffer/createAnswer returns,
@@ -106,7 +151,35 @@ class DesktopWebRTCPeer:
         self._audio_track = None
         self._closed = False
         self._close_task = None
+        self._answered = False
+        self._answer_watchdog = None
+        self._closed_notified = False
         log.info("WebRTC peer created for stream %d", stream_id)
+
+    @property
+    def is_streaming(self):
+        """True while this peer holds a track on the shared capture.
+
+        Counts the whole life of the peer from addTrack until it closes: aiortc
+        reports connectionState "new" for the entire offer->answer window, so
+        gating on connecting/connected would treat a peer that is mid-handshake
+        (but already holding a track) as idle -- letting the capture be stopped
+        under it, or a second track be added alongside it.
+        """
+        return not self._closed and self._audio_track is not None
+
+    def _notify_closed(self):
+        """Invoke the on_closed callback at most once.
+
+        Both the connection-state handler and the answer watchdog can reach this. A
+        second invocation spawns another release/stop, and the late one can land after
+        a new session claimed the capture -- killing it under a live peer.
+        """
+        if self._closed_notified:
+            return
+        self._closed_notified = True
+        if self._on_closed:
+            self._on_closed(self)
 
     def _on_connection_state_change(self):
         state = self._pc.connectionState
@@ -120,8 +193,7 @@ class DesktopWebRTCPeer:
             # track keeps draining the shared queue and starves the live stream.
             # Hold a strong ref so the GC cannot destroy the close task mid-await.
             self._close_task = asyncio.ensure_future(self.close())
-            if self._on_closed:
-                self._on_closed(self)
+            self._notify_closed()
 
     async def create_offer_with_audio(self, audio_track):
         """Add audio track, create SDP offer, and send it via signaling.
@@ -143,6 +215,22 @@ class DesktopWebRTCPeer:
             "sdp": sdp,
         })
         log.info("WebRTC offer sent for stream %d", self._stream_id)
+        # A phone that never answers would otherwise leave this peer holding a track
+        # on the shared capture forever, pinning the capture and starving later
+        # sessions. Self-close if the handshake never completes.
+        self._answer_watchdog = asyncio.ensure_future(self._close_if_unanswered())
+
+    async def _close_if_unanswered(self):
+        try:
+            await asyncio.sleep(self.ANSWER_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if self._closed or self._answered:
+            return
+        log.warning("WebRTC stream %d never answered in %.0fs, closing",
+                    self._stream_id, self.ANSWER_TIMEOUT)
+        await self.close()
+        self._notify_closed()
 
     async def set_answer(self, sdp):
         """Set remote SDP answer from the phone."""
@@ -151,6 +239,13 @@ class DesktopWebRTCPeer:
             if line.startswith("a=candidate"):
                 log.info("Answer candidate: %s", line)
         answer = RTCSessionDescription(sdp=sdp, type="answer")
+        # Claim the answer BEFORE awaiting: setRemoteDescription yields, and if the
+        # watchdog resumes in that gap it would still see _answered False and close a
+        # peer whose answer has already arrived (session silently dead, no retry).
+        self._answered = True
+        if self._answer_watchdog:
+            self._answer_watchdog.cancel()
+            self._answer_watchdog = None
         await self._pc.setRemoteDescription(answer)
         log.info("WebRTC answer set for stream %d", self._stream_id)
 
@@ -159,6 +254,9 @@ class DesktopWebRTCPeer:
         if self._closed:
             return
         self._closed = True
+        if self._answer_watchdog:
+            self._answer_watchdog.cancel()
+            self._answer_watchdog = None
         if self._audio_track:
             self._audio_track.stop()
         try:

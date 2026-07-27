@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
@@ -52,17 +53,19 @@ class ListenerApp:
         self._orchestrator.on_audio_relay_start = self._on_audio_relay_start
         self._orchestrator.on_audio_relay_stop = self._on_audio_relay_stop
         self._orchestrator.on_audio_relay_config = self._on_audio_relay_config
+        self._orchestrator.on_webrtc_initiated = self._cancel_cloud_initiate_watchdog
         self._orchestrator._audio_relay = self._audio_relay
 
         # LAN-direct audio relay: local signaling server + mDNS advertisement.
         # Lets a same-network phone skip the cloud hop for audio streaming.
         self._local_relay = None
         self._mdns = None
+        self._cloud_initiate_watchdog = None
         if config.LOCAL_RELAY_ENABLED:
             self._local_relay = LocalRelayServer(
                 self._audio_relay,
                 port=config.LOCAL_RELAY_PORT,
-                capture_in_use_elsewhere=lambda: self._orchestrator._webrtc_peer is not None,
+                close_other_transport=lambda: self._orchestrator.close_webrtc_peer(),
             )
             self._mdns = MdnsAdvertiser(config.LOCAL_RELAY_PORT, device_id="desktop-listener")
 
@@ -92,14 +95,24 @@ class ListenerApp:
         self._orchestrator.disconnect()
         self._mouse_relay.stop()
         self._keyboard_relay.stop()
+        self._cancel_cloud_initiate_watchdog()
         self._audio_relay.stop()
         async_bridge.stop()
 
     def _on_audio_relay_start(self, bitrate, buffer_seconds=1.0):
         """Called when phone requests desktop audio relay."""
         log.info("Audio relay start requested: bitrate=%d buffer=%.1fs", bitrate, buffer_seconds)
+        # Claim the capture atomically first, then evict the previous owner (see the
+        # matching comment in LocalRelayServer._start_relay).
+        previous = self._audio_relay.claim("cloud")
+        if previous == "lan" and self._local_relay is not None:
+            log.info("Audio relay start (cloud): closing live LAN-direct session")
+            self._local_relay.close_session()
         if not self._audio_relay.start(bitrate, buffer_seconds=buffer_seconds):
             log.error("Audio relay failed to start -- sending error to orchestrator")
+            # Give the claim back, otherwise ownership is pinned to a transport that
+            # never started and no later stop can ever release the capture.
+            self._audio_relay.release("cloud")
             self._orchestrator.send_audio_relay_error("no_monitor_device")
             return
         self._orchestrator.send_audio_relay_ack(
@@ -109,6 +122,34 @@ class ListenerApp:
             self._audio_relay.frame_size,
             self._audio_relay.frame_duration_ms,
         )
+        # If the orchestrator never follows the ack with webrtc_initiate there is no
+        # peer and therefore no watchdog, so the capture would run untouched forever.
+        self._arm_cloud_initiate_watchdog()
+
+    CLOUD_INITIATE_TIMEOUT = 25.0
+
+    def _cancel_cloud_initiate_watchdog(self):
+        if self._cloud_initiate_watchdog is not None:
+            self._cloud_initiate_watchdog.cancel()
+            self._cloud_initiate_watchdog = None
+
+    def _arm_cloud_initiate_watchdog(self):
+        if self._cloud_initiate_watchdog is not None:
+            self._cloud_initiate_watchdog.cancel()
+
+        def _check():
+            # Still owned by the cloud with no peer => the initiate never arrived. The
+            # check runs under the relay lock so an initiate landing right now cannot
+            # slip in between the test and the stop and lose its capture.
+            if self._audio_relay.release_and_stop_if(
+                "cloud", lambda: not self._orchestrator.is_streaming
+            ):
+                log.warning("Audio relay: no webrtc_initiate within %.0fs, released capture",
+                            self.CLOUD_INITIATE_TIMEOUT)
+
+        self._cloud_initiate_watchdog = threading.Timer(self.CLOUD_INITIATE_TIMEOUT, _check)
+        self._cloud_initiate_watchdog.daemon = True
+        self._cloud_initiate_watchdog.start()
 
     def _on_audio_relay_config(self, buffer_seconds):
         """Called when phone updates audio relay config. No-op with WebRTC transport."""
@@ -121,10 +162,15 @@ class ListenerApp:
         # kill audio underneath a live LAN session (the phone stops the cloud
         # session right before starting a LAN one, and the two messages travel
         # over different sockets so they can arrive in either order).
-        if self._local_relay is not None and self._local_relay.session_active:
-            log.info("Audio relay stop skipped: LAN-direct session active")
-            return
-        self._audio_relay.stop()
+        # Always drop the cloud peer: its track would otherwise keep draining the shared
+        # queue, splitting the 50fps capture so the phone receives 25fps with the rest
+        # concealed -- audible as constant lag and stutter.
+        self._cancel_cloud_initiate_watchdog()
+        self._orchestrator.close_webrtc_peer()
+        # Only stop the capture if the cloud still owns it; if the LAN path has taken
+        # over, stopping here would kill audio under a live session.
+        if not self._audio_relay.release_and_stop("cloud"):
+            log.info("Audio relay stop: capture owned by LAN-direct session, leaving it running")
 
 
 def main():
