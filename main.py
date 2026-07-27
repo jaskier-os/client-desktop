@@ -133,7 +133,7 @@ class ListenerApp:
         )
         # If the orchestrator never follows the ack with webrtc_initiate there is no
         # peer and therefore no watchdog, so the capture would run untouched forever.
-        self._arm_cloud_initiate_watchdog()
+        self._arm_cloud_initiate_watchdog(my_gen)
 
     CLOUD_INITIATE_TIMEOUT = 25.0
 
@@ -142,7 +142,7 @@ class ListenerApp:
             self._cloud_initiate_watchdog.cancel()
             self._cloud_initiate_watchdog = None
 
-    def _arm_cloud_initiate_watchdog(self):
+    def _arm_cloud_initiate_watchdog(self, armed_gen):
         if self._cloud_initiate_watchdog is not None:
             self._cloud_initiate_watchdog.cancel()
 
@@ -159,7 +159,6 @@ class ListenerApp:
                 log.warning("Audio relay: no webrtc_initiate within %.0fs, released capture",
                             self.CLOUD_INITIATE_TIMEOUT)
 
-        armed_gen = self._audio_relay.generation
         self._cloud_initiate_watchdog = threading.Timer(self.CLOUD_INITIATE_TIMEOUT, _check)
         self._cloud_initiate_watchdog.daemon = True
         self._cloud_initiate_watchdog.start()

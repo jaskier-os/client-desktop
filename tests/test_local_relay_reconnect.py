@@ -183,5 +183,50 @@ async def main():
     print("PASS: stale teardown and stale messages do not disturb the live session")
 
 
+
+async def reconnect_during_ack():
+    """A reconnect while the ack is in flight must not let the stale flow offer.
+
+    _start_relay checks the socket before acking, but the ack itself yields. If the
+    phone reconnects in that window the stale flow would resume in _create_offer, close
+    the NEW connection's peer and then stop the capture under it -- the phone receives
+    an offer and hears silence, with no error to trigger a retry.
+    """
+    lrs.DesktopWebRTCPeer = FakePeer
+    lrs.PulseAudioTrack = lambda q: object()
+
+    relay = FakeAudioRelay()
+    server = lrs.LocalRelayServer(relay)
+
+    ws_old = FakeWS("old")
+    ws_new = FakeWS("new")
+
+    # The ack send is where the reconnect lands.
+    original_send = server._safe_send
+    swapped = {"done": False}
+
+    async def send_then_reconnect(msg):
+        await original_send(msg)
+        if msg.get("type") == "audio_relay_ack" and not swapped["done"]:
+            swapped["done"] = True
+            server._ws = ws_new  # a newer connection took over mid-ack
+
+    server._safe_send = send_then_reconnect
+
+    t_old = asyncio.create_task(server._handle(ws_old))
+    ws_old.feed({"type": "identify", "deviceId": "phone-01", "deviceType": "phone"})
+    ws_old.feed({"type": "audio_relay_start", "bitrate": 64000, "desktopBuffer": 1.0})
+    await asyncio.sleep(0.2)
+
+    assert server._peer is None, (
+        "REGRESSION: the superseded flow built a peer after the phone reconnected; it "
+        "would close the new session's peer and stop the capture under it"
+    )
+    ws_old.finish()
+    await asyncio.wait_for(t_old, timeout=2)
+    print("PASS: a reconnect during the ack stops the stale flow from offering")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+    asyncio.run(reconnect_during_ack())

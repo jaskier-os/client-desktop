@@ -194,9 +194,16 @@ class LocalRelayServer:
         })
 
         # Collapse the orchestrator's ack -> webrtc_initiate step: offer immediately.
-        await self._create_offer()
+        await self._create_offer(ws)
 
-    async def _create_offer(self):
+    async def _create_offer(self, ws=None):
+        # The ack send above yields, so the phone may have reconnected since the caller
+        # last checked. Without this the stale flow would close the NEW connection's
+        # peer below and then stop the capture under it -- offer received, then silence.
+        if ws is not None and self._ws is not ws:
+            log.info("Local relay: connection superseded before offer, abandoning session")
+            return
+
         # Replace any existing peer (phone re-requesting within the same connection).
         if self._peer is not None:
             old = self._peer
@@ -286,7 +293,8 @@ class LocalRelayServer:
         if self._peer is not peer or self._audio_relay.owner != "lan":
             log.info("Local relay: stream %d superseded during offer (owner=%s), closing orphan",
                      stream_id, self._audio_relay.owner)
-            await self._safe_send({"type": "audio_relay_error", "reason": "superseded"})
+            # Deliberately no error here: a newer peer exists, so _safe_send would write
+            # to ITS connection and make that healthy session tear itself down.
             if self._peer is peer:
                 self._peer = None
             await peer.close()
