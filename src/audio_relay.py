@@ -43,16 +43,27 @@ class AudioRelay:
         # so both attach a track and split the 50fps queue (halved frame rate).
         self._owner = None
         self._generation = 0
+        # Ownership is guarded by its OWN lock, never _lock. _lock is held across
+        # parec terminate+join (up to ~5s), and claim() runs on the asyncio loop --
+        # sharing one lock would stall ICE/DTLS/keepalives behind a teardown.
+        self._owner_lock = threading.Lock()
 
     @property
     def owner(self):
         return self._owner
 
     def claim(self, owner):
-        """Claim capture ownership. Returns the previous owner, if any."""
-        with self._lock:
+        """Claim capture ownership. Returns the previous owner, if any.
+
+        Bumps the generation so any teardown scheduled before this claim is refused.
+        Owner identity alone is not enough: the SAME transport can stop and immediately
+        restart, and the in-flight stop would otherwise still match (nothing had bumped
+        the generation yet because start() has not run) and kill the new capture.
+        """
+        with self._owner_lock:
             previous = self._owner
             self._owner = owner
+            self._generation += 1
             return previous
 
     def release_and_stop_if(self, owner, predicate):
@@ -62,16 +73,17 @@ class AudioRelay:
         (e.g. "is a peer streaming?") cannot be overtaken between checking and acting --
         which would kill the capture of the session that appeared in that gap.
         """
-        with self._lock:
+        with self._owner_lock:
             if self._owner != owner or not predicate():
                 return False
             self._owner = None
+        with self._lock:
             self._stop_locked()
-            return True
+        return True
 
     def release(self, owner):
         """Release ownership if still held by `owner`. Returns True if released."""
-        with self._lock:
+        with self._owner_lock:
             if self._owner == owner:
                 self._owner = None
                 return True
@@ -89,7 +101,7 @@ class AudioRelay:
         call runs, so owner identity alone is not enough. Returns True if this owner
         held the capture at that generation and it was stopped.
         """
-        with self._lock:
+        with self._owner_lock:
             if self._owner != owner:
                 return False
             if generation is not None and generation != self._generation:
@@ -97,8 +109,11 @@ class AudioRelay:
                          generation, self._generation)
                 return False
             self._owner = None
+        # Stop outside the ownership lock so a concurrent claim() is never blocked
+        # behind parec's terminate+join.
+        with self._lock:
             self._stop_locked()
-            return True
+        return True
 
     @property
     def pcm_queue(self):
@@ -110,14 +125,22 @@ class AudioRelay:
         with self._lock:
             return self._start_locked()
 
+    def _bump_generation(self):
+        """Invalidate teardowns scheduled against the previous capture instance.
+
+        Guarded by the ownership lock because that is where the generation is read.
+        """
+        with self._owner_lock:
+            self._generation += 1
+            return self._generation
+
     def _start_locked(self):
         if self._running:
-            # Bump the generation even though the capture is reused: a stop captured
-            # against the OLD generation is on its way (peer death schedules it on a
-            # thread), and without this bump it would match and terminate parec under
-            # the session that just claimed it -- pure silence, no error, no retry.
-            self._generation += 1
-            log.warning("Audio relay already running (generation now %d)", self._generation)
+            # Bump even though the capture is reused: a stop captured against the OLD
+            # generation may be in flight (peer death schedules it on a thread), and
+            # without this it would match and terminate parec under the session that
+            # just claimed it -- pure silence, no error, no retry.
+            log.warning("Audio relay already running (generation now %d)", self._bump_generation())
             return True
 
         # _running is also cleared by the capture loop when it exits on a read error,
@@ -159,7 +182,7 @@ class AudioRelay:
             return False
 
         self._running = True
-        self._generation += 1
+        self._bump_generation()
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
         log.info("Audio relay started: device=%s frame=%dms",

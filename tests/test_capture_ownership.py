@@ -297,7 +297,42 @@ def test_predicate_runs_under_the_lock():
     print("PASS: release_and_stop_if honours its predicate under the lock")
 
 
+def test_claim_invalidates_an_inflight_stop():
+    """A stop scheduled before a re-claim must not kill the capture that follows it.
+
+    The phone can send stop_audio_relay and start_audio_relay back to back. The stop is
+    offloaded to a thread; the reader thread then re-claims for the SAME transport. If
+    claim() does not bump the generation, the in-flight stop still matches (owner is
+    right, and start() has not run yet to bump it), so it tears down ownership and kills
+    the parec the new session is about to use -- leaving owner=None, which then makes
+    every later webrtc_initiate refused and the capture unstoppable. Pure silence with
+    no error and no retry.
+    """
+    relay = AudioRelay()
+    relay.claim("cloud")
+    _fake_started(relay)
+
+    # Teardown captured for the CURRENT session, delivery delayed.
+    stale_gen = relay.generation
+
+    # Same transport immediately re-claims (the stop/start pair).
+    relay.claim("cloud")
+
+    # The delayed stop now lands.
+    killed = relay.release_and_stop("cloud", generation=stale_gen)
+    assert killed is False, (
+        "REGRESSION: a stop scheduled before the re-claim tore down the new session -- "
+        "claim() must invalidate in-flight teardowns"
+    )
+    assert relay.owner == "cloud", (
+        "REGRESSION: ownership was cleared to None; every later initiate would be "
+        "refused and the capture could never be released"
+    )
+    print("PASS: claim invalidates an in-flight stop")
+
+
 if __name__ == "__main__":
+    test_claim_invalidates_an_inflight_stop()
     test_delayed_release_and_stop_respects_generation()
     test_predicate_runs_under_the_lock()
     test_start_while_running_bumps_generation()
