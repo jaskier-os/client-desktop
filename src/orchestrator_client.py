@@ -497,6 +497,19 @@ class OrchestratorClient:
             self.on_webrtc_initiated()
         peer = DesktopWebRTCPeer(stream_id, self._send_signaling, on_closed=_on_peer_closed)
         self._webrtc_peer = peer
+
+        # Re-verify AFTER installing the peer. The gate above and this assignment are not
+        # atomic across threads, and the LAN path evicts by peer identity -- so a
+        # close_webrtc_peer() landing in that window found _webrtc_peer None and did
+        # nothing. Without this re-check we would attach a second track to the queue.
+        if self._audio_relay.owner != "cloud":
+            log.info("Cloud: capture taken by '%s' during setup, dropping stream %d",
+                     self._audio_relay.owner, stream_id)
+            if self._webrtc_peer is peer:
+                self._webrtc_peer = None
+            async_bridge.run_coro(peer.close())
+            return
+
         audio_track = PulseAudioTrack(self._audio_relay.pcm_queue)
 
         def _on_offer_done(f):
@@ -522,8 +535,11 @@ class OrchestratorClient:
             # was in flight (close_webrtc_peer, a newer initiate). Nobody references
             # this one any more, so close it or it streams from the shared capture
             # forever.
-            if self._webrtc_peer is not peer:
-                log.info("Cloud stream %d superseded during offer, closing orphan", stream_id)
+            if self._webrtc_peer is not peer or self._audio_relay.owner != "cloud":
+                log.info("Cloud stream %d superseded during offer (owner=%s), closing orphan",
+                         stream_id, self._audio_relay.owner)
+                if self._webrtc_peer is peer:
+                    self._webrtc_peer = None
                 async_bridge.run_coro(peer.close())
 
         fut = async_bridge.run_coro(self._webrtc_peer.create_offer_with_audio(audio_track))

@@ -216,6 +216,19 @@ class LocalRelayServer:
         # gathers host candidates immediately.
         peer = DesktopWebRTCPeer(stream_id, self._send_signaling, on_closed=_on_peer_closed, ice_servers=[])
         self._peer = peer
+
+        # Re-verify AFTER installing the peer. The gate above and this assignment are not
+        # atomic across threads, and the cloud path evicts by peer identity -- so a
+        # close_session() landing in that window found _peer None and did nothing. Without
+        # this re-check we would then attach a second track to the shared queue.
+        if self._audio_relay.owner != "lan":
+            log.info("Local relay: capture taken by '%s' during setup, dropping stream %d",
+                     self._audio_relay.owner, stream_id)
+            if self._peer is peer:
+                self._peer = None
+            await peer.close()
+            return
+
         track = PulseAudioTrack(self._audio_relay.pcm_queue)
         try:
             await peer.create_offer_with_audio(track)
@@ -239,8 +252,11 @@ class LocalRelayServer:
         # meanwhile (close_session, a newer offer, teardown), this one is orphaned and
         # nobody holds a reference to close it -- it would stream from the shared
         # capture forever. Close it here.
-        if self._peer is not peer:
-            log.info("Local relay: stream %d superseded during offer, closing orphan", stream_id)
+        if self._peer is not peer or self._audio_relay.owner != "lan":
+            log.info("Local relay: stream %d superseded during offer (owner=%s), closing orphan",
+                     stream_id, self._audio_relay.owner)
+            if self._peer is peer:
+                self._peer = None
             await peer.close()
 
     async def _set_answer(self, env):

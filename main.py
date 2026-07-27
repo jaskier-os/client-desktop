@@ -169,8 +169,15 @@ class ListenerApp:
         self._orchestrator.close_webrtc_peer()
         # Only stop the capture if the cloud still owns it; if the LAN path has taken
         # over, stopping here would kill audio under a live session.
-        if not self._audio_relay.release_and_stop("cloud"):
-            log.info("Audio relay stop: capture owned by LAN-direct session, leaving it running")
+        # Offload: release_and_stop holds the relay lock across terminate+join (up to ~5s)
+        # and this runs on the orchestrator's websocket reader thread, which also answers
+        # health pongs and carries mouse/keyboard frames -- blocking it stalls all of them.
+        gen = self._audio_relay.generation
+        threading.Thread(
+            target=lambda: self._audio_relay.release_and_stop("cloud", generation=gen),
+            daemon=True,
+            name="audio-relay-stop",
+        ).start()
 
 
 def main():
