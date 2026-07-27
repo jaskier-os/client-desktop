@@ -28,6 +28,9 @@ class FakeAudioRelay:
         self._q = pcm_queue
         self.running = False
 
+    def start_versioned(self, bitrate, buffer_seconds=None):
+        return self.start(bitrate, buffer_seconds=buffer_seconds), self.generation
+
     def start(self, bitrate, buffer_seconds=None):
         self.running = True
         return True

@@ -82,6 +82,12 @@ class LocalRelayServer:
             # sees itself as stale and skips its own teardown.
             self._ws = ws
             await self._teardown()
+            # Another connection may have arrived during that await and claimed the
+            # slot; overwriting it here would strand that live connection (its messages
+            # are dropped by the stale-connection guard, so it never gets an offer).
+            if self._ws is not ws:
+                log.info("Local relay: superseded while tearing down, dropping this connection")
+                return
         self._ws = ws
         peer = ws.remote_address[0] if ws.remote_address else "?"
         log.info("Local relay: phone connected from %s", peer)
@@ -155,16 +161,18 @@ class LocalRelayServer:
         previous = self._audio_relay.claim("lan")
         if previous == "cloud":
             self._close_other_transport()
-
         loop = asyncio.get_running_loop()
-        started = await loop.run_in_executor(
-            None, lambda: self._audio_relay.start(bitrate, buffer_seconds=buffer_seconds)
+        # Take the generation FROM the start itself: reading it separately could pick up
+        # a newer session's value. Every release/stop below is versioned with it, so a
+        # flow that has been superseded cannot strip or stop a newer session's capture.
+        started, my_gen = await loop.run_in_executor(
+            None, lambda: self._audio_relay.start_versioned(bitrate, buffer_seconds=buffer_seconds)
         )
         if not started:
             log.error("Local relay: AudioRelay failed to start")
             # Give the claim back, otherwise ownership is pinned to a transport that
             # never started and no later stop can ever release the capture.
-            self._audio_relay.release("lan")
+            self._audio_relay.release("lan", generation=my_gen)
             await self._safe_send({"type": "audio_relay_error", "reason": "no_monitor_device"})
             return
 
@@ -173,7 +181,7 @@ class LocalRelayServer:
         # for a session it never asked for (and it would then never get an offer).
         if self._ws is not ws:
             log.info("Local relay: connection superseded during start, abandoning session")
-            self._audio_relay.release("lan")
+            self._audio_relay.release("lan", generation=my_gen)
             return
 
         await self._safe_send({
@@ -207,7 +215,10 @@ class LocalRelayServer:
                 # start then spawns parec anyway. Nothing else would ever stop it --
                 # there is no LAN-side watchdog -- so it would burn CPU with no consumer.
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._audio_relay.stop)
+                gen = self._audio_relay.generation
+                await loop.run_in_executor(
+                    None, lambda: self._audio_relay.stop(generation=gen)
+                )
             return
 
         self._stream_id += 1

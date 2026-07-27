@@ -388,7 +388,40 @@ def test_stop_waiting_on_the_lock_cannot_kill_a_new_capture():
     print("PASS: a teardown blocked on the lock cannot kill a newer capture")
 
 
+
+def test_stale_release_cannot_strip_a_newer_session():
+    """A superseded flow must not release the token a NEWER session now holds.
+
+    Owner names are reused, so a flow that resumes after being superseded would match
+    on the name alone and clear ownership out from under the live session. That session
+    then has its offer refused (the gate requires ownership) and can never release its
+    own capture again -- an orphaned parec for the process lifetime.
+    """
+    relay = AudioRelay()
+    relay.claim("lan")
+    _fake_started(relay)
+    stale_gen = relay.generation
+
+    # The connection is superseded and a NEW session of the same transport takes over.
+    relay.claim("lan")
+    proc_new = _fake_started(relay)
+
+    # The old flow finally resumes and tries to give its claim back.
+    assert relay.release("lan", generation=stale_gen) is False, (
+        "REGRESSION: a superseded flow released the token held by a newer session"
+    )
+    assert relay.owner == "lan", (
+        "REGRESSION: the live session lost ownership; its offer would be refused and "
+        "its capture could never be released"
+    )
+
+    # The live session can still release its own capture normally.
+    assert relay.release_and_stop("lan", generation=relay.generation) is True
+    assert proc_new.terminated
+    print("PASS: a stale release cannot strip a newer session's token")
+
 if __name__ == "__main__":
+    test_stale_release_cannot_strip_a_newer_session()
     test_stop_waiting_on_the_lock_cannot_kill_a_new_capture()
     test_claim_invalidates_an_inflight_stop()
     test_delayed_release_and_stop_respects_generation()

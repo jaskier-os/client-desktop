@@ -656,7 +656,12 @@ class OrchestratorClient:
             except Exception:
                 pass
 
-        async_bridge.run_coro(_close())
+        try:
+            async_bridge.run_coro(_close())
+        except Exception as e:
+            # The loop is already gone (shutdown ordering). The peer was cleared above,
+            # so nothing else would ever close it -- its UDP sockets would leak.
+            log.warning("Could not schedule cloud peer close: %s", e)
 
     def _start_screen_stream(self, request_id, command):
         """Start screen streaming via FFmpeg."""

@@ -93,13 +93,23 @@ class AudioRelay:
             self._stop_locked()
         return True
 
-    def release(self, owner):
-        """Release ownership if still held by `owner`. Returns True if released."""
+    def release(self, owner, generation=None):
+        """Release ownership if still held by `owner` at `generation`.
+
+        `generation` matters because owner names are reused: a superseded flow can
+        resume after a NEW session of the same transport claimed, and releasing on the
+        name alone would strip the live session of its token -- its offer is then
+        refused and its capture can never be released again.
+        """
         with self._owner_lock:
-            if self._owner == owner:
-                self._owner = None
-                return True
-            return False
+            if self._owner != owner:
+                return False
+            if generation is not None and generation != self._generation:
+                log.info("Audio relay: ignoring stale release (gen %s, current %s)",
+                         generation, self._generation)
+                return False
+            self._owner = None
+            return True
 
     def release_and_stop(self, owner, generation=None):
         """Atomically release ownership and stop the capture if `owner` still held it.
@@ -146,6 +156,19 @@ class AudioRelay:
         """Start audio capture. Returns True on success, False on failure."""
         with self._lock:
             return self._start_locked()
+
+    def start_versioned(self, bitrate=64000, buffer_seconds=None):
+        """Start capture and return `(started, generation)` atomically.
+
+        Callers that later release or stop their own session must use the generation
+        this start produced: reading it afterwards can pick up a NEWER session's value
+        (or miss the bump this start made), and the version check would then either
+        fail to protect or wrongly refuse.
+        """
+        with self._lock:
+            started = self._start_locked()
+            with self._owner_lock:
+                return started, self._generation
 
     def _bump_generation(self):
         """Invalidate teardowns scheduled against the previous capture instance.
