@@ -141,12 +141,16 @@ class ListenerApp:
             # Still owned by the cloud with no peer => the initiate never arrived. The
             # check runs under the relay lock so an initiate landing right now cannot
             # slip in between the test and the stop and lose its capture.
+            # Version it: a new session may have claimed+started since this timer was
+            # armed, and it would not yet be streaming -- stopping then would kill the
+            # fresh capture and the initiate that follows would be refused.
             if self._audio_relay.release_and_stop_if(
-                "cloud", lambda: not self._orchestrator.is_streaming
+                "cloud", lambda: not self._orchestrator.is_streaming, generation=armed_gen
             ):
                 log.warning("Audio relay: no webrtc_initiate within %.0fs, released capture",
                             self.CLOUD_INITIATE_TIMEOUT)
 
+        armed_gen = self._audio_relay.generation
         self._cloud_initiate_watchdog = threading.Timer(self.CLOUD_INITIATE_TIMEOUT, _check)
         self._cloud_initiate_watchdog.daemon = True
         self._cloud_initiate_watchdog.start()

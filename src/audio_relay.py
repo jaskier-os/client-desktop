@@ -66,7 +66,7 @@ class AudioRelay:
             self._generation += 1
             return previous
 
-    def release_and_stop_if(self, owner, predicate):
+    def release_and_stop_if(self, owner, predicate, generation=None):
         """Release+stop only if `owner` holds the capture AND `predicate()` is True.
 
         The predicate runs UNDER the lock so a caller that must consult external state
@@ -76,8 +76,20 @@ class AudioRelay:
         with self._owner_lock:
             if self._owner != owner or not predicate():
                 return False
+            if generation is not None and generation != self._generation:
+                log.info("Audio relay: ignoring stale conditional stop (gen %s, current %s)",
+                         generation, self._generation)
+                return False
             self._owner = None
+            claimed_gen = self._generation
         with self._lock:
+            if self._generation != claimed_gen:
+                # Someone claimed while we waited for _lock; they own the capture now
+                # (we already cleared _owner, so do NOT restore it -- their claim wrote
+                # the new owner after ours). Leave their capture running.
+                log.info("Audio relay: capture re-claimed while stopping (gen %s -> %s), leaving it",
+                         claimed_gen, self._generation)
+                return False
             self._stop_locked()
         return True
 
@@ -109,9 +121,19 @@ class AudioRelay:
                          generation, self._generation)
                 return False
             self._owner = None
+            claimed_gen = self._generation
         # Stop outside the ownership lock so a concurrent claim() is never blocked
-        # behind parec's terminate+join.
+        # behind parec's terminate+join. That gap lets another transport claim and
+        # start, so re-verify the generation now that we hold _lock -- otherwise we
+        # would terminate the parec that new session just spawned (silence, no error).
         with self._lock:
+            if self._generation != claimed_gen:
+                # Someone claimed while we waited for _lock; they own the capture now
+                # (we already cleared _owner, so do NOT restore it -- their claim wrote
+                # the new owner after ours). Leave their capture running.
+                log.info("Audio relay: capture re-claimed while stopping (gen %s -> %s), leaving it",
+                         claimed_gen, self._generation)
+                return False
             self._stop_locked()
         return True
 

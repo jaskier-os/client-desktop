@@ -331,7 +331,65 @@ def test_claim_invalidates_an_inflight_stop():
     print("PASS: claim invalidates an in-flight stop")
 
 
+def test_stop_waiting_on_the_lock_cannot_kill_a_new_capture():
+    """A teardown blocked on the capture lock must re-verify before stopping.
+
+    Ownership and the capture use separate locks (so claim() is never blocked behind
+    parec's terminate+join, which would stall the event loop). That leaves a gap: a
+    teardown can pass the ownership check, drop the ownership lock, then wait for the
+    capture lock while ANOTHER transport claims and starts. Without a re-verify it then
+    terminates the parec that new session just spawned -- the phone connects and hears
+    pure silence, with no error and no retry.
+    """
+    relay = AudioRelay()
+    relay.claim("lan")
+    _fake_started(relay)
+    gen = relay.generation
+
+    holder_in = threading.Event()
+    release_holder = threading.Event()
+
+    def hold_capture_lock():
+        with relay._lock:
+            holder_in.set()
+            release_holder.wait(5)
+
+    holder = threading.Thread(target=hold_capture_lock, daemon=True)
+    holder.start()
+    assert holder_in.wait(2), "helper failed to take the capture lock"
+
+    # The LAN teardown starts: it passes the ownership check, then blocks on _lock.
+    result = {}
+
+    def lan_teardown():
+        result["stopped"] = relay.release_and_stop("lan", generation=gen)
+
+    teardown = threading.Thread(target=lan_teardown, daemon=True)
+    teardown.start()
+    time.sleep(0.2)  # let it get past the ownership check and block on _lock
+
+    # Meanwhile the cloud claims and starts a fresh capture.
+    relay.claim("cloud")
+    proc_new = _fake_started(relay)
+
+    # Now let the teardown proceed.
+    release_holder.set()
+    teardown.join(5)
+
+    assert result.get("stopped") is False, (
+        "REGRESSION: a teardown that waited on the capture lock stopped the capture "
+        "anyway -- it must re-verify the generation after acquiring the lock"
+    )
+    assert not proc_new.terminated, (
+        "REGRESSION: the teardown terminated the capture the new session just started; "
+        "the phone would hear pure silence with no error and no retry"
+    )
+    assert relay.owner == "cloud", "the new owner must keep the capture"
+    print("PASS: a teardown blocked on the lock cannot kill a newer capture")
+
+
 if __name__ == "__main__":
+    test_stop_waiting_on_the_lock_cannot_kill_a_new_capture()
     test_claim_invalidates_an_inflight_stop()
     test_delayed_release_and_stop_respects_generation()
     test_predicate_runs_under_the_lock()

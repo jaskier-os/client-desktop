@@ -459,6 +459,14 @@ class OrchestratorClient:
             log.info("New stream %d replacing old stream %d", stream_id, self._webrtc_peer._stream_id)
             old_peer = self._webrtc_peer
             self._webrtc_peer = None
+            # Stop the old track synchronously so it cannot keep draining the shared
+            # queue alongside the replacement: close() yields at pc.close(), so
+            # fire-and-forget leaves a window where both consume and each gets half
+            # the frames. The rest of the teardown may finish asynchronously -- this
+            # runs on the websocket reader thread, and blocking it would stall health
+            # pongs and input frames.
+            if old_peer._audio_track is not None:
+                old_peer._audio_track.stop()
             async_bridge.run_coro(old_peer.close())
 
         if not self._audio_relay:
