@@ -420,7 +420,40 @@ def test_stale_release_cannot_strip_a_newer_session():
     assert proc_new.terminated
     print("PASS: a stale release cannot strip a newer session's token")
 
+
+def test_start_versioned_generation_is_usable_for_release():
+    """The generation a start hands back must be the one a later release matches.
+
+    Reading the generation before the start misses the start's own bump, and reading it
+    after can pick up a claim that landed in between -- either way the session can never
+    release its OWN capture, so parec leaks for the process lifetime.
+    """
+    relay = AudioRelay()
+    relay.claim("lan")
+    # A capture is already running, so start_versioned takes the reuse branch -- the
+    # same bump path a fresh spawn uses. Install the fake proc FIRST so nothing bumps
+    # the generation after the start hands it back.
+    relay._parec_proc = FakeProc()
+    relay._running = True
+    started, my_gen = relay.start_versioned(64000)
+    assert started is True
+
+    # Reading it BEFORE the start (the trap) would be stale by exactly one bump.
+    assert relay.release("lan", generation=my_gen - 1) is False, (
+        "a pre-start generation must not match"
+    )
+    assert relay.owner == "lan", "the failed release must not strip ownership"
+
+    # The generation the start returned is the one that works.
+    assert relay.release("lan", generation=my_gen) is True, (
+        "REGRESSION: the session cannot release its own capture with the generation "
+        "its start returned -- parec would leak for the process lifetime"
+    )
+    assert relay.owner is None
+    print("PASS: start_versioned's generation is usable for release")
+
 if __name__ == "__main__":
+    test_start_versioned_generation_is_usable_for_release()
     test_stale_release_cannot_strip_a_newer_session()
     test_stop_waiting_on_the_lock_cannot_kill_a_new_capture()
     test_claim_invalidates_an_inflight_stop()

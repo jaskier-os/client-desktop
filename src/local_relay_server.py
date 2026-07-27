@@ -209,6 +209,9 @@ class LocalRelayServer:
         if self._audio_relay.owner != "lan":
             owner = self._audio_relay.owner
             log.info("Local relay: skipping offer, capture owned by '%s'", owner)
+            # The ack already went out, so the phone is waiting for an offer that will
+            # never arrive. Tell it, or the session sits silent until its own timeout.
+            await self._safe_send({"type": "audio_relay_error", "reason": "superseded"})
             if owner is None:
                 # Nobody owns it, but a capture may still be running: a concurrent
                 # teardown can clear ownership between our claim and our start, and the
@@ -251,6 +254,7 @@ class LocalRelayServer:
         if self._audio_relay.owner != "lan":
             log.info("Local relay: capture taken by '%s' during setup, dropping stream %d",
                      self._audio_relay.owner, stream_id)
+            await self._safe_send({"type": "audio_relay_error", "reason": "superseded"})
             if self._peer is peer:
                 self._peer = None
             await peer.close()
@@ -282,6 +286,7 @@ class LocalRelayServer:
         if self._peer is not peer or self._audio_relay.owner != "lan":
             log.info("Local relay: stream %d superseded during offer (owner=%s), closing orphan",
                      stream_id, self._audio_relay.owner)
+            await self._safe_send({"type": "audio_relay_error", "reason": "superseded"})
             if self._peer is peer:
                 self._peer = None
             await peer.close()

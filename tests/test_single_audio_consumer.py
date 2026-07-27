@@ -29,7 +29,9 @@ class FakeAudioRelay:
         self.running = False
 
     def start_versioned(self, bitrate, buffer_seconds=None):
-        return self.start(bitrate, buffer_seconds=buffer_seconds), self.generation
+        ok = self.start(bitrate, buffer_seconds=buffer_seconds)
+        self.generation += 1
+        return ok, self.generation
 
     def start(self, bitrate, buffer_seconds=None):
         self.running = True
@@ -47,15 +49,18 @@ class FakeAudioRelay:
     def claim(self, owner):
         prev = getattr(self, "_owner", None)
         self._owner = owner
+        self.generation += 1
         return prev
 
     def release_and_stop(self, owner, generation=None):
-        if self.release(owner):
+        if self.release(owner, generation=generation):
             self.stop()
             return True
         return False
 
-    def release(self, owner):
+    def release(self, owner, generation=None):
+        if generation is not None and generation != self.generation:
+            return False
         if getattr(self, "_owner", None) == owner:
             self._owner = None
             return True

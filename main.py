@@ -112,11 +112,16 @@ class ListenerApp:
         if previous == "lan" and self._local_relay is not None:
             log.info("Audio relay start (cloud): closing live LAN-direct session")
             self._local_relay.close_session()
-        if not self._audio_relay.start(bitrate, buffer_seconds=buffer_seconds):
+        # Take the generation FROM the start: reading it beforehand would miss the
+        # start's own bump, and the release below would then never match.
+        started, my_gen = self._audio_relay.start_versioned(
+            bitrate, buffer_seconds=buffer_seconds
+        )
+        if not started:
             log.error("Audio relay failed to start -- sending error to orchestrator")
             # Give the claim back, otherwise ownership is pinned to a transport that
             # never started and no later stop can ever release the capture.
-            self._audio_relay.release("cloud")
+            self._audio_relay.release("cloud", generation=my_gen)
             self._orchestrator.send_audio_relay_error("no_monitor_device")
             return
         self._orchestrator.send_audio_relay_ack(

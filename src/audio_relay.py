@@ -166,27 +166,31 @@ class AudioRelay:
         fail to protect or wrongly refuse.
         """
         with self._lock:
-            started = self._start_locked()
-            with self._owner_lock:
-                return started, self._generation
+            return self._start_locked(return_generation=True)
 
     def _bump_generation(self):
         """Invalidate teardowns scheduled against the previous capture instance.
 
         Guarded by the ownership lock because that is where the generation is read.
+        Returns the new value, which is the only safe generation for the caller to
+        use: re-reading it afterwards can pick up a claim that landed in between.
         """
         with self._owner_lock:
             self._generation += 1
             return self._generation
 
-    def _start_locked(self):
+    def _start_locked(self, return_generation=False):
+        def _result(ok, gen):
+            return (ok, gen) if return_generation else ok
+
         if self._running:
             # Bump even though the capture is reused: a stop captured against the OLD
             # generation may be in flight (peer death schedules it on a thread), and
             # without this it would match and terminate parec under the session that
             # just claimed it -- pure silence, no error, no retry.
-            log.warning("Audio relay already running (generation now %d)", self._bump_generation())
-            return True
+            gen = self._bump_generation()
+            log.warning("Audio relay already running (generation now %d)", gen)
+            return _result(True, gen)
 
         # _running is also cleared by the capture loop when it exits on a read error,
         # leaving parec alive. Reap that remnant first, otherwise this start would
@@ -200,7 +204,7 @@ class AudioRelay:
         self._monitor_device = self._detect_monitor()
         if not self._monitor_device:
             log.error("No PulseAudio monitor device found")
-            return False
+            return _result(False, self._generation)
 
         # Drain any stale data from previous session
         while not self._pcm_queue.empty():
@@ -224,15 +228,15 @@ class AudioRelay:
             )
         except FileNotFoundError:
             log.error("parec not found -- install pulseaudio-utils")
-            return False
+            return _result(False, self._generation)
 
         self._running = True
-        self._bump_generation()
+        started_gen = self._bump_generation()
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
         log.info("Audio relay started: device=%s frame=%dms",
                  self._monitor_device, self.FRAME_DURATION_MS)
-        return True
+        return _result(True, started_gen)
 
     def stop(self, generation=None):
         """Stop audio capture.
