@@ -62,6 +62,32 @@ async def main():
     assert track.stopped, "close() must stop the audio track so it stops consuming"
     assert not peer.is_streaming, "closed peer must not pin the capture"
 
+    # 4a. The watchdog must still notify when pc.close() SUSPENDS (real ICE/DTLS
+    #     teardown does). The watchdog runs as the very task close() cancels, so a
+    #     cancellation delivered inside close() must not swallow the notification --
+    #     nothing else clears the peer reference or releases the capture.
+    peer_s, _ = _make_peer(9)
+    peer_s.ANSWER_TIMEOUT = 0.05
+    peer_s._audio_track = FakeTrack()
+    notified = []
+    peer_s._on_closed = lambda p: notified.append(p)
+
+    real_close = peer_s._pc.close
+
+    async def suspending_close():
+        await asyncio.sleep(0)  # where the cancellation is delivered
+        return await real_close()
+
+    peer_s._pc.close = suspending_close
+    peer_s._answer_watchdog = asyncio.ensure_future(peer_s._close_if_unanswered())
+    await asyncio.sleep(0.3)
+    assert notified, (
+        "REGRESSION: the answer watchdog was cancelled by its own close() before it "
+        "could notify -- the peer reference is never cleared and the capture is never "
+        "released, so parec runs with no consumer and the transport cannot restart"
+    )
+    assert not peer_s.is_streaming, "the timed-out peer must release the capture"
+
     # 4. A peer that is never answered must self-close, or it pins the capture forever.
     peer2, _ = _make_peer(2)
     peer2.ANSWER_TIMEOUT = 0.2

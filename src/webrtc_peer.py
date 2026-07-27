@@ -229,8 +229,16 @@ class DesktopWebRTCPeer:
             return
         log.warning("WebRTC stream %d never answered in %.0fs, closing",
                     self._stream_id, self.ANSWER_TIMEOUT)
-        await self.close()
+        # We ARE the watchdog task, and close() cancels it. Detach first, or the
+        # cancellation lands on the first suspension inside pc.close() and unwinds us
+        # before the notify below -- nothing would then clear the peer reference or
+        # release the capture, leaving parec running with no consumer and the
+        # transport unable to start again.
+        self._answer_watchdog = None
+        # Notify BEFORE closing as well: close() suspends, and this must not depend on
+        # surviving it.
         self._notify_closed()
+        await self.close()
 
     async def set_answer(self, sdp):
         """Set remote SDP answer from the phone."""
