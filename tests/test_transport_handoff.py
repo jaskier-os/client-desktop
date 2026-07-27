@@ -119,5 +119,53 @@ async def main():
     print("PASS: losing a handoff mid-start attaches no second consumer")
 
 
+
+async def ownership_lost_after_offer_reports_error():
+    """Losing only the capture (peer still ours) must tell the phone.
+
+    Suppressing the error is correct when a NEWER peer exists -- that peer owns the
+    connection and would tear itself down. But when our peer is still installed and only
+    the capture moved on, nothing else will offer on this connection, so a silent bail
+    leaves the phone acked and waiting for an offer that never comes.
+    """
+    relay = AudioRelay()
+    relay._running = True
+    relay._generation = 1
+
+    # The cloud steals the capture DURING the offer await, leaving our peer installed.
+    class StealDuringOffer(FakePeer):
+        async def create_offer_with_audio(self, track):
+            relay.claim("cloud")
+
+    lrs.DesktopWebRTCPeer = StealDuringOffer
+    lrs.PulseAudioTrack = lambda q: object()
+
+    server = lrs.LocalRelayServer(relay)
+    ws = FakeWS()
+    server._ws = ws
+
+    relay.claim("lan")
+    my_gen = relay.generation
+
+    sent = []
+
+    async def capture(msg):
+        sent.append(msg)
+
+    server._safe_send = capture
+
+    # Drive the REAL _create_offer so the production branch decides what to send.
+    await server._create_offer(ws, my_gen)
+
+    reasons = [m.get("reason") for m in sent]
+    assert "superseded" in reasons, (
+        "REGRESSION: the session was dropped for losing the capture without telling the "
+        f"phone; it stays acked and waits for an offer that never arrives (sent={sent})"
+    )
+    assert server._peer is None, "the abandoned peer must not stay installed"
+    print("PASS: losing only the capture reports an error to the phone")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+    asyncio.run(ownership_lost_after_offer_reports_error())

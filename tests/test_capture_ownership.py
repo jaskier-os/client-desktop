@@ -489,7 +489,40 @@ def test_shutdown_refuses_a_late_start():
     assert not relay._running, "no capture may be running after shutdown"
     print("PASS: shutdown refuses a late start")
 
+
+def test_orphan_stop_uses_the_sessions_own_generation():
+    """The abandon-path stop must be versioned to the session that armed it.
+
+    _create_offer bails when it no longer owns the capture and stops what it started.
+    Re-reading the generation there picks up whatever transport claimed in the meantime,
+    so the stop matches THAT session and terminates its live parec -- the phone hears
+    silence with no error.
+    """
+    relay = AudioRelay()
+    relay.claim("lan")
+    relay._parec_proc = FakeProc()
+    relay._running = True
+    _started, my_gen = relay.start_versioned(64000)
+
+    # Our session loses the capture; the cloud claims and starts its own.
+    relay.claim("cloud")
+    cloud_proc = _fake_started(relay)
+
+    # The abandon path fires with OUR generation -- it must not touch the cloud capture.
+    relay.stop(generation=my_gen)
+    assert not cloud_proc.terminated, (
+        "REGRESSION: the abandon path stopped another transport's live capture; "
+        "re-reading the generation instead of using the session's own would do this"
+    )
+    assert relay._running, "the cloud capture must still be running"
+
+    # A stop versioned to the CURRENT session still works.
+    relay.stop(generation=relay.generation)
+    assert cloud_proc.terminated
+    print("PASS: the abandon-path stop is scoped to its own session")
+
 if __name__ == "__main__":
+    test_orphan_stop_uses_the_sessions_own_generation()
     test_shutdown_refuses_a_late_start()
     test_start_versioned_generation_is_usable_for_release()
     test_stale_release_cannot_strip_a_newer_session()
