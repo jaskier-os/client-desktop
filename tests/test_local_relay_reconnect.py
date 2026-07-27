@@ -227,6 +227,48 @@ async def reconnect_during_ack():
     print("PASS: a reconnect during the ack stops the stale flow from offering")
 
 
+
+async def reconnect_during_peer_close():
+    """A reconnect while the OLD peer is closing must not build a second track.
+
+    _create_offer re-checks the connection on entry, but replacing an existing peer
+    awaits its close(). A reconnect during that await leaves the stale flow to install
+    its peer over the new connection's one and attach a SECOND PulseAudioTrack to the
+    shared queue -- each side then receives half the frames, and the clobbered peer has
+    no reference left to close it.
+    """
+    lrs.DesktopWebRTCPeer = FakePeer
+    tracks = []
+    lrs.PulseAudioTrack = lambda q: tracks.append(q) or object()
+
+    relay = FakeAudioRelay()
+    server = lrs.LocalRelayServer(relay)
+
+    ws_old = FakeWS("old")
+    ws_new = FakeWS("new")
+    server._ws = ws_old
+    relay.claim("lan")
+
+    # An existing peer whose close() yields -- the reconnect lands right there.
+    class SlowClosingPeer(FakePeer):
+        async def close(self):
+            server._ws = ws_new  # phone reconnected while we were closing
+            await asyncio.sleep(0)
+            await FakePeer.close(self)
+
+    server._peer = SlowClosingPeer(1, lambda *a: None)
+
+    await server._create_offer(ws_old, relay.generation)
+
+    assert not tracks, (
+        f"REGRESSION: the superseded flow attached {len(tracks)} track(s) after the "
+        "phone reconnected during the peer close -- two consumers would split the "
+        "shared queue and each side would get half the frames"
+    )
+    print("PASS: a reconnect during the peer close builds no second track")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
     asyncio.run(reconnect_during_ack())
+    asyncio.run(reconnect_during_peer_close())

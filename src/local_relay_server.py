@@ -211,6 +211,14 @@ class LocalRelayServer:
             self._peer = None
             await old.close()
 
+            # close() yields, so re-check: a reconnect during it would leave us building
+            # a peer for a dead connection, clobbering the new one's peer reference and
+            # attaching a SECOND track to the shared queue -- each side then gets half
+            # the frames, and the orphaned peer has no reference left to close it.
+            if self._ws is not ws:
+                log.info("Local relay: connection superseded while replacing peer, abandoning session")
+                return
+
         # The cloud path may have taken the capture while _start_relay was suspended in
         # its executor hop. Attaching a track anyway would put two consumers on the
         # shared queue -- each transport then gets half the frames (audible stutter).
