@@ -47,6 +47,10 @@ class AudioRelay:
         # parec terminate+join (up to ~5s), and claim() runs on the asyncio loop --
         # sharing one lock would stall ICE/DTLS/keepalives behind a teardown.
         self._owner_lock = threading.Lock()
+        # Set once shutdown begins. The websocket reader thread is never joined, so a
+        # start can otherwise land after the final stop() and orphan a parec that holds
+        # the monitor source with no consumer for as long as the box is up.
+        self._shutdown = False
 
     @property
     def owner(self):
@@ -183,6 +187,10 @@ class AudioRelay:
         def _result(ok, gen):
             return (ok, gen) if return_generation else ok
 
+        if self._shutdown:
+            log.info("Audio relay: refusing start, shutting down")
+            return _result(False, self._generation)
+
         if self._running:
             # Bump even though the capture is reused: a stop captured against the OLD
             # generation may be in flight (peer death schedules it on a thread), and
@@ -237,6 +245,12 @@ class AudioRelay:
         log.info("Audio relay started: device=%s frame=%dms",
                  self._monitor_device, self.FRAME_DURATION_MS)
         return _result(True, started_gen)
+
+    def shutdown(self):
+        """Stop for good: refuse any later start, then stop the capture."""
+        with self._lock:
+            self._shutdown = True
+            self._stop_locked()
 
     def stop(self, generation=None):
         """Stop audio capture.

@@ -452,7 +452,45 @@ def test_start_versioned_generation_is_usable_for_release():
     assert relay.owner is None
     print("PASS: start_versioned's generation is usable for release")
 
+
+def test_shutdown_refuses_a_late_start():
+    """After shutdown, a start arriving on the reader thread must not spawn a capture.
+
+    The websocket reader thread is never joined, so a start can land after the final
+    stop. Without a fence it spawns parec, the app exits, and that capture is orphaned
+    holding the monitor source with no consumer.
+    """
+    relay = AudioRelay()
+    relay.claim("cloud")
+    proc = _fake_started(relay)
+
+    relay.shutdown()
+    assert proc.terminated, "shutdown must stop the running capture"
+    assert not relay._running, "shutdown must leave no capture running"
+
+    # A start that raced shutdown must be refused BEFORE any device work happens.
+    # Make detection succeed so the only thing that can refuse is the shutdown fence.
+    probed = {"n": 0}
+
+    def _detect():
+        probed["n"] += 1
+        return "fake.monitor"
+
+    relay._detect_monitor = _detect
+    started, _gen = relay.start_versioned(64000)
+    assert probed["n"] == 0, (
+        "REGRESSION: a start after shutdown reached device detection -- the fence must "
+        "refuse it before it can spawn a capture"
+    )
+    assert started is False, (
+        "REGRESSION: a start after shutdown was accepted -- it would orphan a parec "
+        "holding the monitor source for the life of the session"
+    )
+    assert not relay._running, "no capture may be running after shutdown"
+    print("PASS: shutdown refuses a late start")
+
 if __name__ == "__main__":
+    test_shutdown_refuses_a_late_start()
     test_start_versioned_generation_is_usable_for_release()
     test_stale_release_cannot_strip_a_newer_session()
     test_stop_waiting_on_the_lock_cannot_kill_a_new_capture()

@@ -194,9 +194,9 @@ class LocalRelayServer:
         })
 
         # Collapse the orchestrator's ack -> webrtc_initiate step: offer immediately.
-        await self._create_offer(ws)
+        await self._create_offer(ws, my_gen)
 
-    async def _create_offer(self, ws):
+    async def _create_offer(self, ws, my_gen):
         # The ack send above yields, so the phone may have reconnected since the caller
         # last checked. Without this the stale flow would close the NEW connection's
         # peer below and then stop the capture under it -- offer received, then silence.
@@ -226,9 +226,11 @@ class LocalRelayServer:
                 # start then spawns parec anyway. Nothing else would ever stop it --
                 # there is no LAN-side watchdog -- so it would burn CPU with no consumer.
                 loop = asyncio.get_running_loop()
-                gen = self._audio_relay.generation
+                # Use OUR session's generation, not a fresh read: another transport may
+                # have claimed and started since, and stopping on its generation would
+                # terminate its live capture.
                 await loop.run_in_executor(
-                    None, lambda: self._audio_relay.stop(generation=gen)
+                    None, lambda: self._audio_relay.stop(generation=my_gen)
                 )
             return
 
@@ -291,11 +293,20 @@ class LocalRelayServer:
         # meanwhile (close_session, a newer offer, teardown), this one is orphaned and
         # nobody holds a reference to close it -- it would stream from the shared
         # capture forever. Close it here.
-        if self._peer is not peer or self._audio_relay.owner != "lan":
+        superseded_by_peer = self._peer is not peer
+        if superseded_by_peer or self._audio_relay.owner != "lan":
             log.info("Local relay: stream %d superseded during offer (owner=%s), closing orphan",
                      stream_id, self._audio_relay.owner)
-            # Deliberately no error here: a newer peer exists, so _safe_send would write
-            # to ITS connection and make that healthy session tear itself down.
+            if superseded_by_peer:
+                # A newer peer exists, so _safe_send would write to ITS connection and
+                # make that healthy session tear itself down. Stay quiet; the newer peer
+                # sends its own offer.
+                pass
+            else:
+                # Our peer is still installed, only the capture moved on. Nothing else
+                # will offer on this connection, so tell the phone or it waits out its
+                # own timeout after having been acked.
+                await self._safe_send({"type": "audio_relay_error", "reason": "superseded"})
             if self._peer is peer:
                 self._peer = None
             await peer.close()

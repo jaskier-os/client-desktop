@@ -107,7 +107,7 @@ class ListenerApp:
         self._mouse_relay.stop()
         self._keyboard_relay.stop()
         self._cancel_cloud_initiate_watchdog()
-        self._audio_relay.stop()
+        self._audio_relay.shutdown()
         async_bridge.stop()
 
     def _on_audio_relay_start(self, bitrate, buffer_seconds=1.0):
