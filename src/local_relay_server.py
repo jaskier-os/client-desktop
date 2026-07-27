@@ -124,7 +124,7 @@ class LocalRelayServer:
         if msg_type == "identify":
             log.info("Local relay: identify from %s (%s)", env.get("deviceId", "?"), env.get("deviceType", "?"))
         elif msg_type == "audio_relay_start":
-            await self._start_relay(env)
+            await self._start_relay(ws, env)
         elif msg_type == "audio_relay_stop":
             log.info("Local relay: audio_relay_stop")
             await self._teardown()
@@ -143,7 +143,7 @@ class LocalRelayServer:
         else:
             log.debug("Local relay: ignoring message type %s", msg_type)
 
-    async def _start_relay(self, env):
+    async def _start_relay(self, ws, env):
         bitrate = env.get("bitrate", 64000)
         buffer_seconds = env.get("desktopBuffer", 1.0)
         log.info("Local relay: audio_relay_start bitrate=%d buffer=%.1fs", bitrate, buffer_seconds)
@@ -166,6 +166,14 @@ class LocalRelayServer:
             # never started and no later stop can ever release the capture.
             self._audio_relay.release("lan")
             await self._safe_send({"type": "audio_relay_error", "reason": "no_monitor_device"})
+            return
+
+        # The phone may have reconnected while we were in the executor hop; _safe_send
+        # targets the CURRENT socket, so acking here would answer the new connection
+        # for a session it never asked for (and it would then never get an offer).
+        if self._ws is not ws:
+            log.info("Local relay: connection superseded during start, abandoning session")
+            self._audio_relay.release("lan")
             return
 
         await self._safe_send({
@@ -191,7 +199,15 @@ class LocalRelayServer:
         # its executor hop. Attaching a track anyway would put two consumers on the
         # shared queue -- each transport then gets half the frames (audible stutter).
         if self._audio_relay.owner != "lan":
-            log.info("Local relay: skipping offer, capture owned by '%s'", self._audio_relay.owner)
+            owner = self._audio_relay.owner
+            log.info("Local relay: skipping offer, capture owned by '%s'", owner)
+            if owner is None:
+                # Nobody owns it, but a capture may still be running: a concurrent
+                # teardown can clear ownership between our claim and our start, and the
+                # start then spawns parec anyway. Nothing else would ever stop it --
+                # there is no LAN-side watchdog -- so it would burn CPU with no consumer.
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._audio_relay.stop)
             return
 
         self._stream_id += 1
@@ -323,6 +339,10 @@ class LocalRelayServer:
         if peer is None:
             return
         self._peer = None
+        # Stop the track synchronously: the close below is asynchronous, and the other
+        # transport may attach its own track before it completes.
+        if peer._audio_track is not None:
+            peer._audio_track.stop()
 
         async def _close():
             try:

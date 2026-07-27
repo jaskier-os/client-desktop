@@ -645,6 +645,10 @@ class OrchestratorClient:
         if peer is None:
             return
         self._webrtc_peer = None
+        # Stop the track synchronously: the close below is asynchronous, and the other
+        # transport may attach its own track before it completes.
+        if peer._audio_track is not None:
+            peer._audio_track.stop()
 
         async def _close():
             try:

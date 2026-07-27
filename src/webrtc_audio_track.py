@@ -7,6 +7,7 @@ import time
 import queue
 
 from aiortc import MediaStreamTrack
+from aiortc.mediastreams import MediaStreamError
 import av
 
 from src.audio_relay import AudioRelay
@@ -83,14 +84,14 @@ class PulseAudioTrack(MediaStreamTrack):
         # reconnect storm then splits the shared queue with the live one, halving
         # each consumer's frame rate (phone gets 25fps + heavy concealment).
         if self.readyState != "live":
-            raise Exception("Track ended")
+            raise MediaStreamError("Track ended")
         waited = 0.0
         while True:
             try:
                 return self._queue.get(timeout=0.1)
             except queue.Empty:
                 if self.readyState != "live":
-                    raise Exception("Track ended")
+                    raise MediaStreamError("Track ended")
                 waited += 0.1
                 if waited >= SILENCE_TIMEOUT:
                     return SILENCE_FRAME

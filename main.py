@@ -92,6 +92,10 @@ class ListenerApp:
             self._mdns.stop()
         if self._local_relay:
             self._local_relay.stop()
+        # Close the cloud peer explicitly rather than relying on _on_close: that runs on
+        # the websocket reader thread and can land after the loop is gone, leaving the
+        # RTCPeerConnection and its UDP sockets open.
+        self._orchestrator.close_webrtc_peer()
         self._orchestrator.disconnect()
         self._mouse_relay.stop()
         self._keyboard_relay.stop()
