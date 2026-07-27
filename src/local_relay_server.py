@@ -196,11 +196,12 @@ class LocalRelayServer:
         # Collapse the orchestrator's ack -> webrtc_initiate step: offer immediately.
         await self._create_offer(ws)
 
-    async def _create_offer(self, ws=None):
+    async def _create_offer(self, ws):
         # The ack send above yields, so the phone may have reconnected since the caller
         # last checked. Without this the stale flow would close the NEW connection's
         # peer below and then stop the capture under it -- offer received, then silence.
-        if ws is not None and self._ws is not ws:
+        # `ws` is required: a default would let a future caller skip this check silently.
+        if self._ws is not ws:
             log.info("Local relay: connection superseded before offer, abandoning session")
             return
 

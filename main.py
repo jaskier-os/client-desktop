@@ -61,6 +61,11 @@ class ListenerApp:
         self._local_relay = None
         self._mdns = None
         self._cloud_initiate_watchdog = None
+        # Armed from the websocket reader thread, cancelled from the Qt thread at
+        # shutdown -- without this lock a shutdown can be overtaken by an arm and leave
+        # a Timer running past it.
+        self._watchdog_lock = threading.Lock()
+        self._shutting_down = False
         if config.LOCAL_RELAY_ENABLED:
             self._local_relay = LocalRelayServer(
                 self._audio_relay,
@@ -88,6 +93,8 @@ class ListenerApp:
 
     def shutdown(self):
         log.info("Shutting down...")
+        with self._watchdog_lock:
+            self._shutting_down = True
         if self._mdns:
             self._mdns.stop()
         if self._local_relay:
@@ -138,14 +145,12 @@ class ListenerApp:
     CLOUD_INITIATE_TIMEOUT = 25.0
 
     def _cancel_cloud_initiate_watchdog(self):
-        if self._cloud_initiate_watchdog is not None:
-            self._cloud_initiate_watchdog.cancel()
-            self._cloud_initiate_watchdog = None
+        with self._watchdog_lock:
+            if self._cloud_initiate_watchdog is not None:
+                self._cloud_initiate_watchdog.cancel()
+                self._cloud_initiate_watchdog = None
 
     def _arm_cloud_initiate_watchdog(self, armed_gen):
-        if self._cloud_initiate_watchdog is not None:
-            self._cloud_initiate_watchdog.cancel()
-
         def _check():
             # Still owned by the cloud with no peer => the initiate never arrived. The
             # check runs under the relay lock so an initiate landing right now cannot
@@ -159,9 +164,15 @@ class ListenerApp:
                 log.warning("Audio relay: no webrtc_initiate within %.0fs, released capture",
                             self.CLOUD_INITIATE_TIMEOUT)
 
-        self._cloud_initiate_watchdog = threading.Timer(self.CLOUD_INITIATE_TIMEOUT, _check)
-        self._cloud_initiate_watchdog.daemon = True
-        self._cloud_initiate_watchdog.start()
+        with self._watchdog_lock:
+            if self._shutting_down:
+                return
+            if self._cloud_initiate_watchdog is not None:
+                self._cloud_initiate_watchdog.cancel()
+            timer = threading.Timer(self.CLOUD_INITIATE_TIMEOUT, _check)
+            timer.daemon = True
+            self._cloud_initiate_watchdog = timer
+            timer.start()
 
     def _on_audio_relay_config(self, buffer_seconds):
         """Called when phone updates audio relay config. No-op with WebRTC transport."""
